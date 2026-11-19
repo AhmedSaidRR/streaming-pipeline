@@ -317,3 +317,107 @@ place as evidence rather than deleted.
 - `schema.yml` uses the pre-1.10 generic-test shape (`to:` / `field:` instead of `arguments:`);
   it works but warns (Phase 4).
 
+---
+
+# STOP POINT — 2026-11-19, during Phase 2
+
+Status: **Phase 0 and Phase 1 are complete, verified and committed. Phase 2 is coded but only
+partly verified.** Nothing after Phase 2 has been started. The stack is left running.
+
+## Verified so far in Phase 2
+
+1. The old dead-letter stream was proven to capture real bad messages with Kafka coordinates.
+   Four messages were produced and read back from the lake:
+
+```
+[missing_symbol]   offset=6450 -> not json at all
+[non_positive_price] offset=6451 -> {"symbol": "BTCUSDT", "price": -5, ...}
+[missing_symbol]   offset=6452 -> {"symbol": "", "price": 123, ...}
+[missing_price]    offset=6453 -> {"symbol": "ETHUSDT", ...}
+```
+
+2. That run exposed a real classification bug: Spark's `from_json` in permissive mode returns a
+   **non-null struct with null fields** for garbage input, so the `t IS NULL` check never fired
+   and `not json at all` was labelled `missing_symbol`. Fixed in code with an explicit
+   "is it a JSON object?" guard (`trim(value)` starts with `{` and ends with `}`) that yields
+   `unparseable_json`.
+
+3. Spark restart with a deleted `dead_letter` checkpoint (and intact `ticks` / `windows`
+   checkpoints) resumed correctly and kept writing windows:
+
+```
+INFO spark.streaming - batch 48 written to Postgres
+INFO spark.streaming - batch 51 written to Postgres
+```
+
+4. `kafka-console-producer` fed through a PowerShell pipe silently delivered nothing on the
+   second attempt. The deterministic method, used afterwards, is:
+
+```
+docker compose cp <file> kafka:/tmp/bad_messages.txt
+docker compose exec -T kafka sh -c \
+  "/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 \
+   --topic crypto.prices < /tmp/bad_messages.txt"
+```
+
+With that method the topic end offset moved from 7980 to 8116, i.e. the six test messages were
+really produced.
+
+## Coded in Phase 2 but NOT yet verified
+
+- `spark/streaming_job.py`
+  - dead-letter rows now carry `error_reason`, `kafka_topic`, `kafka_partition`, `kafka_offset`,
+    `kafka_timestamp`, `rejected_at`, `rejected_date`
+  - reasons: `empty_value`, `unparseable_json`, `missing_symbol`, `missing_price`,
+    `non_positive_price`, `invalid_event_time`
+  - `write_windows_to_postgres` logs the batch, copies a failed batch to
+    `s3://datalake/dead_letter/sink_failures/batch_id=<n>` and then re-raises so Spark retries
+- `scripts/replay_dlq.py` (new): `--list`-style listing via `--dry-run`, `--reason` filter,
+  `--set key=value` to repair a message before replaying, `--limit`
+- `scripts/lake_ls.py` now prints `LastModified`
+- `requirements.txt`: `pyarrow==17.0.0` (needed to read the dead-letter Parquet)
+- `docker-compose.yml`: producer / dashboard / lake-init share one image tag
+  (`streaming-pipeline-app:1.0.0`) instead of building three
+
+## Not done in Phase 2
+
+- Re-reading the dead letter after the reason fix, to show `unparseable_json` and
+  `invalid_event_time` actually appear.
+- The replay happy path: `--reason missing_price --set price=9999.99 --limit 1`, then proving
+  the repaired message became a valid tick (expect `max(max_price)=9999.99` for ETHUSDT in the
+  matching minute).
+- The sink-failure proof: stop `warehouse`, confirm batches land in
+  `dead_letter/sink_failures/`, restart it and confirm the stream catches up.
+
+## Exact next step
+
+```
+# 1. Reasons after the fix (was interrupted, run it again)
+docker compose run --rm --no-deps producer python scripts/replay_dlq.py --dry-run --limit 10
+
+# 2. Replay one repaired message
+docker compose run --rm --no-deps producer python scripts/replay_dlq.py \
+  --reason missing_price --set price=9999.99 --limit 1
+# wait ~90 s, then:
+docker compose exec -T warehouse psql -U warehouse -d warehouse -c \
+  "select symbol, window_start, max_price from raw.price_windows
+   where symbol='ETHUSDT' order by window_start desc limit 5;"
+
+# 3. Sink failure
+docker compose stop warehouse
+# produce valid ticks, wait ~60 s, list s3://datalake/dead_letter/sink_failures/
+docker compose start warehouse
+```
+
+Then append the outputs here and commit with a `fix(stream):`/`feat(dlq):` message before
+starting Phase 3 (metrics + end-to-end latency).
+
+## Session-side notes
+
+- Test file used for bad messages:
+  `C:\Users\DELL\AppData\Local\Temp\opencode\bad_messages.txt`
+- Local git identity is `Pipeline Dev <dev@localhost>` (repo-local only).
+- Docker Hub is intermittently slow on this machine: pulls must be retried (a 5-attempt loop
+  was enough every time).
+
+

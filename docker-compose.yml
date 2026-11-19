@@ -67,6 +67,7 @@ services:
     restart: unless-stopped
 
   lake-init:
+    image: streaming-pipeline-app:1.0.0
     build:
       context: .
       dockerfile: Dockerfile.app
@@ -98,6 +99,7 @@ services:
     restart: unless-stopped
 
   producer:
+    image: streaming-pipeline-app:1.0.0
     build:
       context: .
       dockerfile: Dockerfile.app
@@ -221,6 +223,7 @@ services:
     restart: unless-stopped
 
   dashboard:
+    image: streaming-pipeline-app:1.0.0
     build:
       context: .
       dockerfile: Dockerfile.app

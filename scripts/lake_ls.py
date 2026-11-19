@@ -15,7 +15,7 @@ def main():
         print(f"no objects under s3://{bucket}/{prefix}")
         return
     for obj in objects:
-        print(f"{obj['Size']:>10}  s3://{bucket}/{obj['Key']}")
+        print(f"{obj['Size']:>10}  {obj['LastModified']:%Y-%m-%d %H:%M:%S}  s3://{bucket}/{obj['Key']}")
     print(f"-- {len(objects)} object(s) (truncated={resp.get('IsTruncated', False)})")
 
 

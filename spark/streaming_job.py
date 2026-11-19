@@ -1,13 +1,17 @@
 """Spark Structured Streaming job.
 
-Kafka (crypto.prices) -> validate
+Kafka (crypto.prices) -> validate (each rejection carries a reason)
   |-- valid ticks   -> S3 lake Parquet  (raw data lake, partitioned by date)
   |-- valid ticks   -> 1-minute tumbling window per symbol -> PostgreSQL raw.price_windows
-  |-- invalid msgs  -> S3 dead_letter/ (never silently dropped)
+  |-- invalid msgs  -> S3 dead_letter/ with cause + Kafka coordinates (never silently dropped)
+  |-- failed sink   -> S3 dead_letter/sink_failures/ (quarantine before retrying)
 """
+import logging
 import os
 
 from pyspark.sql import SparkSession, functions as F, types as T
+
+log = logging.getLogger("spark.streaming")
 
 KAFKA = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "crypto.prices")
@@ -15,6 +19,7 @@ BUCKET = os.getenv("S3_BUCKET", "datalake")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://lake:8333")
 CKPT = "/checkpoints"
 TRIGGER = "30 seconds"
+WATERMARK = "1 minute"
 
 JDBC_URL = "jdbc:postgresql://{h}:{p}/{d}".format(
     h=os.getenv("WH_HOST", "warehouse"), p=os.getenv("WH_PORT", "5432"), d=os.getenv("WH_DB", "warehouse"))
@@ -46,10 +51,27 @@ def build_spark() -> SparkSession:
 
 
 def write_windows_to_postgres(batch_df, batch_id):
-    batch_df.write.jdbc(JDBC_URL, "raw.price_windows", mode="append", properties=JDBC_PROPS)
+    """Append one microbatch to the warehouse.
+
+    At-least-once on purpose: dbt dedupes. If Postgres is unavailable the batch is copied to
+    the lake first, then the exception is re-raised so Spark retries instead of losing data
+    or wedging silently.
+    """
+    try:
+        batch_df.write.jdbc(JDBC_URL, "raw.price_windows", mode="append", properties=JDBC_PROPS)
+        log.info("batch %s written to Postgres", batch_id)
+    except Exception:
+        log.exception("batch %s failed to reach Postgres; quarantining to the lake", batch_id)
+        try:
+            batch_df.write.mode("append").parquet(
+                f"s3a://{BUCKET}/dead_letter/sink_failures/batch_id={batch_id}")
+        except Exception:
+            log.exception("quarantine write also failed for batch %s", batch_id)
+        raise
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
 
@@ -58,19 +80,35 @@ def main():
            .option("subscribe", TOPIC)
            .option("startingOffsets", "latest")
            .option("failOnDataLoss", "false")
-           .load()
-           .select(F.col("value").cast("string").alias("value")))
+           .load())
 
-    parsed = (raw.withColumn("t", F.from_json("value", SCHEMA))
-              .withColumn("event_ts", F.col("t.event_time").cast("timestamp")))
-    is_valid = (F.col("t.symbol").isNotNull() & (F.col("t.price") > 0) & F.col("event_ts").isNotNull())
+    parsed = (raw.select(
+                F.col("value").cast("string").alias("raw_value"),
+                F.col("topic").alias("kafka_topic"),
+                F.col("partition").alias("kafka_partition"),
+                F.col("offset").alias("kafka_offset"),
+                F.col("timestamp").alias("kafka_timestamp"))
+              .withColumn("t", F.from_json("raw_value", SCHEMA))
+              .withColumn("event_ts", F.col("t.event_time").cast("timestamp"))
+              .withColumn("error_reason",
+                          F.when(F.col("raw_value").isNull() | (F.length("raw_value") == 0), "empty_value")
+                           # permissive from_json never returns a null struct, so check for an
+                           # actual JSON object before blaming a missing field
+                           .when(~(F.trim("raw_value").startswith("{") & F.trim("raw_value").endswith("}")),
+                                 "unparseable_json")
+                           .when(F.col("t.symbol").isNull() | (F.length("t.symbol") == 0), "missing_symbol")
+                           .when(F.col("t.price").isNull(), "missing_price")
+                           .when(F.col("t.price") <= 0, "non_positive_price")
+                           .when(F.col("event_ts").isNull(), "invalid_event_time")))
 
-    ticks = (parsed.filter(is_valid)
+    ticks = (parsed.where(F.col("error_reason").isNull())
              .select(F.upper("t.symbol").alias("symbol"), F.col("t.price").alias("price"),
                      F.col("event_ts").alias("event_time"), F.col("t.source").alias("source")))
 
-    dead = (parsed.filter(~is_valid)
-            .select("value", F.current_timestamp().alias("rejected_at"))
+    dead = (parsed.where(F.col("error_reason").isNotNull())
+            .select("raw_value", "error_reason", "kafka_topic", "kafka_partition",
+                    "kafka_offset", "kafka_timestamp",
+                    F.current_timestamp().alias("rejected_at"))
             .withColumn("rejected_date", F.to_date("rejected_at")))
 
     q_raw = (ticks.withColumn("event_date", F.to_date("event_time"))
@@ -86,7 +124,7 @@ def main():
               .partitionBy("rejected_date")
               .trigger(processingTime=TRIGGER).start())
 
-    windows = (ticks.withWatermark("event_time", "1 minute")
+    windows = (ticks.withWatermark("event_time", WATERMARK)
                .groupBy(F.window("event_time", "1 minute"), "symbol")
                .agg(F.avg("price").alias("avg_price"), F.min("price").alias("min_price"),
                     F.max("price").alias("max_price"), F.count("*").alias("tick_count"))
@@ -100,6 +138,7 @@ def main():
              .option("checkpointLocation", f"{CKPT}/windows")
              .trigger(processingTime=TRIGGER).start())
 
+    log.info("streaming queries started: %s", [q.name for q in spark.streams.active])
     spark.streams.awaitAnyTermination()
 
 

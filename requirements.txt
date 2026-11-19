@@ -1,6 +1,7 @@
 confluent-kafka==2.5.3
 requests==2.32.3
 boto3==1.35.24
+pyarrow==17.0.0
 streamlit==1.38.0
 pandas==2.2.2
 SQLAlchemy==2.0.32
