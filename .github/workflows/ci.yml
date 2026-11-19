@@ -1,0 +1,15 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: python -m py_compile spark/streaming_job.py dags/analytics_pipeline.py dashboard/app.py
+      - run: pytest -q
+      - run: cp .env.example .env && docker compose config -q

@@ -1,0 +1,26 @@
+name: streaming_pipeline
+version: "1.0.0"
+config-version: 2
+profile: streaming
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+vars:
+  volatility_threshold_pct: 0.15   # a 1-minute window with (max-min)/avg above this % is "volatile"
+
+models:
+  streaming_pipeline:
+    staging:
+      +schema: staging
+      +materialized: view
+    marts:
+      +schema: marts
+      +materialized: table
+
+seeds:
+  streaming_pipeline:
+    +schema: reference

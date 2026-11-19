@@ -1,0 +1,7 @@
+version: 2
+sources:
+  - name: raw
+    schema: raw
+    tables:
+      - name: price_windows
+        description: "1-minute price windows written by Spark Structured Streaming (at-least-once, may contain duplicates)."

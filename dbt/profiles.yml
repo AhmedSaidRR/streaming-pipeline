@@ -1,0 +1,12 @@
+streaming:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('WH_HOST', 'warehouse') }}"
+      port: "{{ env_var('WH_PORT', '5432') | as_number }}"
+      user: "{{ env_var('WH_USER', 'warehouse') }}"
+      password: "{{ env_var('WH_PASSWORD', 'warehouse') }}"
+      dbname: "{{ env_var('WH_DB', 'warehouse') }}"
+      schema: analytics
+      threads: 2

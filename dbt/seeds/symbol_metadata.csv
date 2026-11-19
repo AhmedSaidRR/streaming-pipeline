@@ -1,0 +1,6 @@
+symbol,display_name,asset_class,is_active
+BTCUSDT,Bitcoin,Store of Value,true
+ETHUSDT,Ethereum,Smart Contract Platform,true
+BNBUSDT,BNB,Exchange Token,true
+SOLUSDT,Solana,Smart Contract Platform,true
+XRPUSDT,XRP,Payments,true
