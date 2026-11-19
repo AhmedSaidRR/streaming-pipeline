@@ -1,3 +1,21 @@
+# One-command local stack. `docker compose up -d --build` must work with or without a local
+# .env file: every value below has a safe local default, and .env only overrides them.
+name: streaming-pipeline
+
+x-app-env: &app-env
+  KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP:-kafka:9092}
+  KAFKA_TOPIC: ${KAFKA_TOPIC:-crypto.prices}
+  S3_ENDPOINT: ${S3_ENDPOINT:-http://lake:8333}
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-lakeadmin}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-lakeadmin123}
+  S3_BUCKET: ${S3_BUCKET:-datalake}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  WH_HOST: ${WH_HOST:-warehouse}
+  WH_PORT: ${WH_PORT:-5432}
+  WH_USER: ${WH_USER:-warehouse}
+  WH_PASSWORD: ${WH_PASSWORD:-warehouse}
+  WH_DB: ${WH_DB:-warehouse}
+
 services:
   kafka:
     image: apache/kafka:3.8.0
@@ -15,11 +33,19 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
     volumes:
       - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
 
-  # S3-compatible object store (data lake). MinIO's free images were removed from
-  # Docker Hub and dl.min.io (404 / 410 / quay 401), so the lake runs on SeaweedFS.
+  # S3-compatible object store (data lake). MinIO's free images were removed upstream
+  # (Docker Hub 404, dl.min.io 410, quay 401 - see VERIFICATION.md), so the lake is SeaweedFS.
   lake:
     # Pinned by digest: the repo publishes no semantic version tags.
     image: chrislusf/seaweedfs@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15
@@ -38,98 +64,181 @@ services:
       interval: 5s
       timeout: 3s
       retries: 24
+    restart: unless-stopped
 
   lake-init:
     build:
       context: .
       dockerfile: Dockerfile.app
     command: python scripts/init_lake.py
-    env_file: .env
+    environment:
+      <<: *app-env
     depends_on:
       lake:
         condition: service_healthy
     restart: "no"
 
   warehouse:
-    image: postgres:16
+    image: postgres:16.16
     environment:
-      POSTGRES_USER: ${WH_USER}
-      POSTGRES_PASSWORD: ${WH_PASSWORD}
-      POSTGRES_DB: ${WH_DB}
+      POSTGRES_USER: ${WH_USER:-warehouse}
+      POSTGRES_PASSWORD: ${WH_PASSWORD:-warehouse}
+      POSTGRES_DB: ${WH_DB:-warehouse}
     ports:
       - "5433:5432"
     volumes:
       - warehouse_data:/var/lib/postgresql/data
       - ./sql/init_warehouse.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
 
   producer:
     build:
       context: .
       dockerfile: Dockerfile.app
     command: python -m producer.main
-    env_file: .env
-    depends_on: [kafka]
+    environment:
+      <<: *app-env
+      SOURCE: ${SOURCE:-simulated}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT}
+      POLL_INTERVAL_SEC: ${POLL_INTERVAL_SEC:-1}
+      SIM_EXTRA_SYMBOLS: ${SIM_EXTRA_SYMBOLS:-0}
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      kafka:
+        condition: service_healthy
     restart: unless-stopped
 
   spark:
-    image: apache/spark:3.5.3-scala2.12-java17-python3-ubuntu
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    image: streaming-pipeline-spark:3.5.3
+    # The image already carries every connector jar, so a cold start needs no Maven access.
+    command: /opt/spark/bin/spark-submit /app/spark/streaming_job.py
     user: root
+    environment:
+      <<: *app-env
     depends_on:
-      kafka: 
-        condition: service_started
+      kafka:
+        condition: service_healthy
+      warehouse:
+        condition: service_healthy
       lake-init:
         condition: service_completed_successfully
-      warehouse:
-        condition: service_started
-    env_file: .env
-    restart: on-failure
     volumes:
       - ./spark:/app/spark
       - spark_checkpoints:/checkpoints
-    command: >
-      /opt/spark/bin/spark-submit
-      --conf spark.jars.ivy=/tmp/.ivy2
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,org.apache.hadoop:hadoop-aws:3.3.4,org.postgresql:postgresql:42.7.3
-      /app/spark/streaming_job.py
+    restart: on-failure
 
   airflow-db:
-    image: postgres:16
+    image: postgres:16.16
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
     volumes:
       - airflow_meta:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
 
-  airflow:
+  airflow-init:
+    image: streaming-pipeline-airflow:2.10.5-dbt1.11
     build:
       context: .
       dockerfile: Dockerfile.airflow
-    depends_on: [airflow-db, warehouse]
-    ports:
-      - "8080:8080"
-    env_file: .env
-    environment:
+    command: >
+      bash -c "airflow db migrate &&
+      (airflow users create --username admin --password admin --firstname a --lastname b
+      --role Admin --email a@b.com || true)"
+    environment: &airflow-env
+      <<: *app-env
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-local-dev-secret-change-me}
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      warehouse:
+        condition: service_healthy
+    restart: "no"
+
+  airflow-webserver:
+    image: streaming-pipeline-airflow:2.10.5-dbt1.11
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    command: webserver
+    environment: *airflow-env
+    ports:
+      - "8080:8080"
     volumes:
       - ./dags:/opt/airflow/dags
       - ./dbt:/opt/airflow/dbt
-    command: >
-      bash -c "airflow db migrate &&
-      airflow users create --username admin --password admin --firstname a --lastname b --role Admin --email a@b.com || true;
-      airflow scheduler & airflow webserver"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    image: streaming-pipeline-airflow:2.10.5-dbt1.11
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    command: scheduler
+    environment: *airflow-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./dbt:/opt/airflow/dbt
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\" || exit 1"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   dashboard:
     build:
       context: .
       dockerfile: Dockerfile.app
     command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
-    env_file: .env
-    depends_on: [warehouse]
+    environment:
+      <<: *app-env
+    depends_on:
+      warehouse:
+        condition: service_healthy
     ports:
       - "8501:8501"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8501/_stcore/health')\""]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 30s
+    restart: unless-stopped
 
 volumes:
   kafka_data:

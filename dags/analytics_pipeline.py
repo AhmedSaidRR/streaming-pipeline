@@ -37,7 +37,13 @@ with DAG(
     default_args={"retries": 1, "retry_delay": timedelta(minutes=1)},
     tags=["portfolio", "streaming", "dbt"],
 ) as dag:
-    freshness = PythonOperator(task_id="check_stream_freshness", python_callable=check_stream_freshness)
+    freshness = PythonOperator(
+        task_id="check_stream_freshness",
+        python_callable=check_stream_freshness,
+        # First boot after `docker compose up` has no windows yet; give the stream time to catch up.
+        retries=3,
+        retry_delay=timedelta(seconds=60),
+    )
     dbt_seed = BashOperator(task_id="dbt_seed", bash_command=DBT_CMD.format("seed"))
     dbt_snapshot = BashOperator(task_id="dbt_snapshot", bash_command=DBT_CMD.format("snapshot"))
     dbt_run = BashOperator(task_id="dbt_run", bash_command=DBT_CMD.format("run"))

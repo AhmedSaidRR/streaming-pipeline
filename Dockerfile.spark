@@ -1,0 +1,29 @@
+# Spark + connectors, baked at build time.
+#
+# Why: `spark-submit --packages ...` resolves from Maven Central on every cold start. That made
+# the first boot take ~4 minutes and fail outright when Maven was slow or unreachable.
+FROM apache/spark:3.5.3-scala2.12-java17-python3-ubuntu
+
+USER root
+
+ARG MAVEN=https://repo1.maven.org/maven2
+
+# Versions are the ones Ivy resolved for Spark 3.5.3; keep them in sync with the Spark image.
+RUN set -eux; \
+    cd /opt/spark/jars; \
+    for artifact in \
+        org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.3/spark-sql-kafka-0-10_2.12-3.5.3.jar \
+        org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.3/spark-token-provider-kafka-0-10_2.12-3.5.3.jar \
+        org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar \
+        org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar \
+        org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar \
+        com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar \
+        org/postgresql/postgresql/42.7.3/postgresql-42.7.3.jar \
+    ; do \
+        curl -fsSL -O "${MAVEN}/${artifact}"; \
+    done; \
+    ls -l \
+        spark-sql-kafka-0-10_2.12-3.5.3.jar \
+        hadoop-aws-3.3.4.jar \
+        aws-java-sdk-bundle-1.12.262.jar \
+        postgresql-42.7.3.jar

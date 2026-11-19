@@ -176,3 +176,144 @@ reused by the verify script.
   Phase 1.
 - `lake` is the only service with a healthcheck, so boot order is still partly luck.
 - No dead-letter proof yet, no metrics, no dbt run (Phase 2-4).
+
+## Phase 1 — boot reliability
+
+Goals: no Maven at startup, deterministic service order, `up` works without `.env`, everything
+pinned, Airflow split into webserver/scheduler.
+
+### 1.1 Spark connectors baked into the image
+
+`Dockerfile.spark` downloads the exact jars Ivy resolved in Phase 0 (spark-sql-kafka,
+kafka-clients, commons-pool2, hadoop-aws, aws-java-sdk-bundle, postgresql).
+
+```
+> docker compose build spark
++ curl -fsSL -O .../spark-sql-kafka-0-10_2.12-3.5.3.jar
++ curl -fsSL -O .../aws-java-sdk-bundle-1.12.262.jar
+-rw-r--r-- 1 root root 280645251 aws-java-sdk-bundle-1.12.262.jar
+-rw-r--r-- 1 root root    962685 hadoop-aws-3.3.4.jar
+-rw-r--r-- 1 root root   1089312 postgresql-42.7.3.jar
+-rw-r--r-- 1 root root    432340 spark-sql-kafka-0-10_2.12-3.5.3.jar
+#7 DONE 145.5s
+ Image streaming-pipeline-spark:3.5.3 Built
+```
+
+After this, a cold start has zero `Ivy` / `downloading` lines and no `--packages` flag.
+
+### 1.2 Boot times (previous ~4 minutes, mostly Ivy)
+
+| Boot | Command | Result | Time |
+|---|---|---|---|
+| 1 | `docker compose down` + `up -d --build` | 9 services up | 33 s |
+| 2 | `.env` moved out of the repo, `down` + `up -d` | 9 services up, `compose config` still OK | 36 s |
+| 3 | `down` + `up -d` | 9 services up | 33 s |
+| 4 | `down -v` (all volumes wiped) + `up -d` | 9 services up, DAG unpaused | 26 s |
+
+Boot 2 proves the "one command" claim without a `.env`:
+
+```
+> Test-Path .env
+False
+> docker compose config --quiet
+config_without_env_exit=0
+```
+
+Health after boot 4:
+
+```
+SERVICE             STATUS
+airflow-db          Up About a minute (healthy)
+airflow-scheduler   Up About a minute (healthy)
+airflow-webserver   Up About a minute (healthy)
+dashboard           Up About a minute (healthy)
+kafka               Up About a minute (healthy)
+lake                Up About a minute (healthy)
+producer            Up About a minute
+spark               Up About a minute
+warehouse           Up About a minute (healthy)
+```
+
+`producer` and `spark` have no HTTP endpoint, so they have no healthcheck; Spark uses
+`restart: on-failure`.
+
+### 1.3 DAG is live without manual unpausing
+
+On a fresh metadata database:
+
+```
+> docker compose exec -T airflow-webserver airflow dags list
+dag_id              | fileloc                                  | owners  | is_paused
+====================+==========================================+=========+==========
+streaming_analytics | /opt/airflow/dags/analytics_pipeline.py  | airflow | False
+```
+
+### 1.4 Bug found and fixed: dbt resolved to an incompatible core
+
+First DAG run failed at `dbt_seed`. The task log had no dbt output because I had set
+`AIRFLOW__LOGGING__LOGGING_LEVEL=WARNING` (removed). Running the command by hand showed the
+real cause:
+
+```
+> docker compose exec -T airflow-scheduler sh -c \
+    "cd /opt/airflow/dbt && /home/airflow/dbt_venv/bin/dbt seed --profiles-dir ."
+   dbt-oss 2.0.11
+[error] [InvalidConfig (dbt1005)]: Configuration Error: The 'postgres' adapter is not yet
+supported by dbt. Supported adapters: snowflake, bigquery, databricks, redshift, duckdb, ...
+
+> docker compose exec -T airflow-scheduler sh -c \
+    "/home/airflow/dbt_venv/bin/pip list | grep -i dbt"
+dbt-core                  2.0.0rc10
+dbt-postgres              1.8.2
+```
+
+Root cause: `dbt-postgres==1.8.2` has no upper bound on `dbt-core`, so pip installed the 2.x
+release candidate, which ships a different CLI (`dbt-oss`) that refuses the postgres adapter.
+Fix: pin both packages (`dbt-core==1.11.0`, `dbt-postgres==1.11.0`) and share one image across
+the three Airflow services.
+
+### 1.5 dbt pipeline runs end to end
+
+```
+> dbt seed        ... Completed successfully   (INSERT 5)
+> dbt snapshot    ... OK snapshotted snapshots.symbol_metadata_snapshot (SELECT 5)
+> dbt run         ... PASS=6 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=6
+> dbt test        ... PASS=15 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=15
+```
+
+Marts after the run:
+
+```
+ dims | facts | hourly | alerts | history
+------+-------+--------+--------+---------
+    5 |    60 |      5 |     53 |       5
+```
+
+### 1.6 Airflow runs the DAG on its own
+
+```
+dag_id              | run_id                              | state   | start_date          | end_date
+streaming_analytics | manual__2026-11-19T02:28:17+00:00   | success | 02:28:17            | 02:28:44
+streaming_analytics | scheduled__2026-11-19T02:25:00+00:00| success | 02:30:00            | 02:30:28
+```
+
+The three earlier failures in the metadata DB are from before the dbt fix and were left in
+place as evidence rather than deleted.
+
+### 1.7 Reproducibility notes
+
+- `postgres:16` resolved to 16.16; pinning to `16.4` produced a collation mismatch against the
+  existing volume. Pinned to **16.16** instead, which matches the volumes that were created.
+- The lake image has no semantic version tags, so it is pinned by digest.
+- `env_file` was removed from every service; all values are `${VAR:-default}` and a local
+  `.env` (or the shell environment) overrides them.
+
+### 1.8 Still open after Phase 1
+
+- No dead-letter evidence and no sink-failure handling (Phase 2).
+- No metrics/latency (Phase 3).
+- The dbt `unique` test on `stg_price_windows` cannot fail because the view already dedupes
+  (Phase 4).
+- `schema.yml` uses the pre-1.10 generic-test shape (`to:` / `field:` instead of `arguments:`);
+  it works but warns (Phase 4).
+
