@@ -24,7 +24,8 @@ def dead_letter_keys(client, bucket, prefix, limit):
     keys = []
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".parquet"):
+            # sink_failures holds quarantined window batches, not rejected ticks
+            if obj["Key"].endswith(".parquet") and "/sink_failures/" not in obj["Key"]:
                 keys.append((obj["LastModified"], obj["Key"]))
     keys.sort(reverse=True)
     return [key for _, key in keys[:limit]]

@@ -47,7 +47,25 @@ def build_spark() -> SparkSession:
             .config("spark.hadoop.fs.s3a.change.detection.mode", "none")
             .config("spark.hadoop.fs.s3a.change.detection.version.required", "false")
             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+            # v1's commitJob re-merges stale _temporary task dirs left by earlier runs on
+            # S3-compatible stores; v2 commits per task and does not need that merge.
+            .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
             .getOrCreate())
+
+
+def write_dead_letter(batch_df, batch_id):
+    """Append rejected rows as Parquet without a streaming file-sink metadata log.
+
+    The built-in Parquet stream sink keeps a `_spark_metadata` log keyed by batch id.
+    Resetting the checkpoint (e.g. after changing the dead-letter schema in Phase 2)
+    leaves that log behind with higher batch ids, so Spark silently skips every new
+    batch and no dead letters are written at all. A plain batch write has no such
+    log, so it cannot drift out of sync with the checkpoint.
+    """
+    if batch_df.isEmpty():
+        return
+    (batch_df.write.mode("append").partitionBy("rejected_date")
+     .parquet(f"s3a://{BUCKET}/dead_letter"))
 
 
 def write_windows_to_postgres(batch_df, batch_id):
@@ -118,10 +136,8 @@ def main():
              .partitionBy("event_date")
              .trigger(processingTime=TRIGGER).start())
 
-    q_dead = (dead.writeStream.format("parquet")
-              .option("path", f"s3a://{BUCKET}/dead_letter")
+    q_dead = (dead.writeStream.foreachBatch(write_dead_letter)
               .option("checkpointLocation", f"{CKPT}/dead_letter")
-              .partitionBy("rejected_date")
               .trigger(processingTime=TRIGGER).start())
 
     windows = (ticks.withWatermark("event_time", WATERMARK)

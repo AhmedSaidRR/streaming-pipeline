@@ -319,15 +319,42 @@ place as evidence rather than deleted.
 
 ---
 
-# STOP POINT — 2026-11-19, during Phase 2
+# STOP POINT — 2026-11-19, Phase 2 complete
 
-Status: **Phase 0 and Phase 1 are complete, verified and committed. Phase 2 is coded but only
-partly verified.** Nothing after Phase 2 has been started. The stack is left running.
+Status: **Phase 0, 1 and 2 are complete, verified and committed. Phase 3 (metrics) has NOT
+been started.** The stack is left running.
 
-## Verified so far in Phase 2
+## 2.0 Resume: stack up
 
-1. The old dead-letter stream was proven to capture real bad messages with Kafka coordinates.
-   Four messages were produced and read back from the lake:
+```
+> docker compose up -d
+ Container streaming-pipeline-spark-1 Running
+ Container streaming-pipeline-producer-1 Recreate
+ Container streaming-pipeline-dashboard-1 Recreate
+ ...
+ Container streaming-pipeline-lake-init-1 Exited
+Exit code: 1
+```
+Exit code 1 is the known PowerShell stderr quirk (Docker writes progress to stderr); container
+state is the source of truth.
+
+```
+> docker compose ps
+NAME                                     IMAGE                                                                                         COMMAND                  SERVICE             CREATED          STATUS                             PORTS
+streaming-pipeline-airflow-db-1          postgres:16.16                                                                                "docker-entrypoint.s…"   airflow-db          11 hours ago     Up 30 seconds (healthy)            5432/tcp
+streaming-pipeline-airflow-scheduler-1   streaming-pipeline-airflow:2.10.5-dbt1.11                                                     "/usr/bin/dumb-init …"   airflow-scheduler   11 hours ago     Up 11 seconds (health: starting)   8080/tcp
+streaming-pipeline-airflow-webserver-1   streaming-pipeline-airflow:2.10.5-dbt1.11                                                     "/usr/bin/dumb-init …"   airflow-webserver   11 hours ago     Up 11 seconds (health: starting)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+streaming-pipeline-dashboard-1           streaming-pipeline-app:1.0.0                                                                  "streamlit run dashb…"   dashboard           32 seconds ago   Up 24 seconds (healthy)            0.0.0.0:8501->8501/tcp, [::]:8501->8501/tcp
+streaming-pipeline-kafka-1               apache/kafka:3.8.0                                                                            "/__cacert_entrypoin…"   kafka               11 hours ago     Up 30 seconds (healthy)            9092/tcp
+streaming-pipeline-lake-1                chrislusf/seaweedfs@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15   "/entrypoint.sh serv…"   lake                11 hours ago     Up 31 seconds (healthy)            0.0.0.0:8333->8333/tcp, [::]:8333->8333/tcp, 0.0.0.0:8888->8888/tcp, [::]:8888->8888/tcp, 0.0.0.0:9333->9333/tcp, [::]:9333->9333/tcp
+streaming-pipeline-producer-1            streaming-pipeline-app:1.0.0                                                                  "python -m producer.…"   producer            32 seconds ago   Up 22 seconds
+streaming-pipeline-spark-1               streaming-pipeline-spark:3.5.3                                                                "/opt/entrypoint.sh …"   spark               11 hours ago     Up 16 minutes
+streaming-pipeline-warehouse-1           postgres:16.16                                                                                "docker-entrypoint.s…"   warehouse           11 hours ago     Up 30 seconds (healthy)            0.0.0.0:5433->5432/tcp, [::]:5433->5432/tcp
+```
+
+## 2.1 Earlier Phase 2 findings (kept from the previous session)
+
+1. The old dead-letter stream captured real bad messages with Kafka coordinates:
 
 ```
 [missing_symbol]   offset=6450 -> not json at all
@@ -336,22 +363,13 @@ partly verified.** Nothing after Phase 2 has been started. The stack is left run
 [missing_price]    offset=6453 -> {"symbol": "ETHUSDT", ...}
 ```
 
-2. That run exposed a real classification bug: Spark's `from_json` in permissive mode returns a
-   **non-null struct with null fields** for garbage input, so the `t IS NULL` check never fired
-   and `not json at all` was labelled `missing_symbol`. Fixed in code with an explicit
-   "is it a JSON object?" guard (`trim(value)` starts with `{` and ends with `}`) that yields
-   `unparseable_json`.
+2. That run exposed a classification bug: Spark's permissive `from_json` returns a non-null
+   struct with null fields for garbage input, so `t IS NULL` never fired and `not json at all`
+   was labelled `missing_symbol`. Fixed with an explicit "is it a JSON object?" guard
+   (`trim(value)` starts with `{` and ends with `}`) yielding `unparseable_json`.
 
-3. Spark restart with a deleted `dead_letter` checkpoint (and intact `ticks` / `windows`
-   checkpoints) resumed correctly and kept writing windows:
-
-```
-INFO spark.streaming - batch 48 written to Postgres
-INFO spark.streaming - batch 51 written to Postgres
-```
-
-4. `kafka-console-producer` fed through a PowerShell pipe silently delivered nothing on the
-   second attempt. The deterministic method, used afterwards, is:
+3. Deterministic way to inject messages (a PowerShell pipe into `kafka-console-producer` silently
+   delivered nothing on one attempt):
 
 ```
 docker compose cp <file> kafka:/tmp/bad_messages.txt
@@ -360,64 +378,218 @@ docker compose exec -T kafka sh -c \
    --topic crypto.prices < /tmp/bad_messages.txt"
 ```
 
-With that method the topic end offset moved from 7980 to 8116, i.e. the six test messages were
-really produced.
+## 2.2 Bug found while verifying: dead letters silently stopped being written
 
-## Coded in Phase 2 but NOT yet verified
+After the reason fix, newly produced bad messages never appeared in the lake, even though the
+`dead_letter` checkpoint advanced (e.g. `offsets/24` committed at 13:38 with end offset 10633)
+and no exceptions were logged.
 
-- `spark/streaming_job.py`
-  - dead-letter rows now carry `error_reason`, `kafka_topic`, `kafka_partition`, `kafka_offset`,
-    `kafka_timestamp`, `rejected_at`, `rejected_date`
-  - reasons: `empty_value`, `unparseable_json`, `missing_symbol`, `missing_price`,
-    `non_positive_price`, `invalid_event_time`
-  - `write_windows_to_postgres` logs the batch, copies a failed batch to
-    `s3://datalake/dead_letter/sink_failures/batch_id=<n>` and then re-raises so Spark retries
-- `scripts/replay_dlq.py` (new): `--list`-style listing via `--dry-run`, `--reason` filter,
-  `--set key=value` to repair a message before replaying, `--limit`
-- `scripts/lake_ls.py` now prints `LastModified`
-- `requirements.txt`: `pyarrow==17.0.0` (needed to read the dead-letter Parquet)
-- `docker-compose.yml`: producer / dashboard / lake-init share one image tag
-  (`streaming-pipeline-app:1.0.0`) instead of building three
-
-## Not done in Phase 2
-
-- Re-reading the dead letter after the reason fix, to show `unparseable_json` and
-  `invalid_event_time` actually appear.
-- The replay happy path: `--reason missing_price --set price=9999.99 --limit 1`, then proving
-  the repaired message became a valid tick (expect `max(max_price)=9999.99` for ETHUSDT in the
-  matching minute).
-- The sink-failure proof: stop `warehouse`, confirm batches land in
-  `dead_letter/sink_failures/`, restart it and confirm the stream catches up.
-
-## Exact next step
+Root cause, proven by listing the lake and checkpoint:
 
 ```
-# 1. Reasons after the fix (was interrupted, run it again)
-docker compose run --rm --no-deps producer python scripts/replay_dlq.py --dry-run --limit 10
-
-# 2. Replay one repaired message
-docker compose run --rm --no-deps producer python scripts/replay_dlq.py \
-  --reason missing_price --set price=9999.99 --limit 1
-# wait ~90 s, then:
-docker compose exec -T warehouse psql -U warehouse -d warehouse -c \
-  "select symbol, window_start, max_price from raw.price_windows
-   where symbol='ETHUSDT' order by window_start desc limit 5;"
-
-# 3. Sink failure
-docker compose stop warehouse
-# produce valid ticks, wait ~60 s, list s3://datalake/dead_letter/sink_failures/
-docker compose start warehouse
+> python scripts/lake_ls.py dead_letter
+  2  2026-11-19 02:16:52  s3://datalake/dead_letter/_spark_metadata/0
+  ...
+  2  2026-11-19 02:40:00  s3://datalake/dead_letter/_spark_metadata/47
+2603  2026-11-19 02:38:30  s3://datalake/dead_letter/rejected_date=2026-11-19/part-...parquet
 ```
 
-Then append the outputs here and commit with a `fix(stream):`/`feat(dlq):` message before
-starting Phase 3 (metrics + end-to-end latency).
+The built-in Parquet **stream sink** keeps a `_spark_metadata` log keyed by batch id. The schema
+change required deleting the `dead_letter` checkpoint, but that left the metadata log behind with
+batch ids up to 47. Every newly committed batch had a lower id (0, 1, 2, ...) and Spark silently
+skipped it, so no Parquet was ever written. Clearing only the checkpoint did not help; a stray
+`_spark_metadata/32` (2 bytes, content `v1`) was enough to suppress all new batches again.
+
+Fix in `spark/streaming_job.py`:
+- dead-letter output now uses `foreachBatch(write_dead_letter)` with a plain partitioned Parquet
+  write, so there is no file-sink metadata log that can drift from the checkpoint;
+- committers switched to `mapreduce.fileoutputcommitter.algorithm.version=2`. Version 1's
+  `commitJob` re-merges stale `_temporary` task directories on S3-compatible stores and crashed
+  the stream with:
+
+```
+26/11/19 13:53:31 ERROR FileFormatWriter: Aborting job 7aa1a97d-...
+java.io.FileNotFoundException: No such file or directory:
+s3a://datalake/dead_letter/_temporary/0/task_202611191351313453154111589611508_0007_m_000000/rejected_date=2026-11-19
+```
+
+The old rows were preserved under `dead_letter_evidence_backup/` before each reset.
+
+## 2.3 PROOF 1 — `unparseable_json` and `invalid_event_time` carry reason + offset
+
+Produced three bad messages (the classifier was also verified in isolation with `spark-submit`,
+which returned `unparseable_json` and `invalid_event_time` for these exact values):
+
+```
+> produce_all_bad.py
+produced: not json at all
+produced: {"symbol": "BTCUSDT", "price": 100, "event_time": "not-a-real-date"}
+produced: {"symbol": "ETHUSDT", "event_time": "2026-11-19T13:56:06.917598+00:00"}
+
+> docker compose run --rm --no-deps producer python scripts/replay_dlq.py --dry-run --limit 20
+[unparseable_json] offset=16070 -> not json at all
+[invalid_event_time] offset=16071 -> {"symbol": "BTCUSDT", "price": 100, "event_time": "not-a-real-date"}
+[missing_price] offset=16072 -> {"symbol": "ETHUSDT", "event_time": "2026-11-19T13:56:06.917598+00:00"}
+```
+
+Both required reasons are present with their real Kafka offsets. `missing_price` is also there,
+which is used for Proof 2.
+
+## 2.4 PROOF 2 — replay repairs a `missing_price` row into a valid tick
+
+```
+> docker compose run --rm --no-deps producer python scripts/replay_dlq.py \
+    --reason missing_price --set price=9999.99 --limit 1
+[missing_price] offset=16072 -> {"symbol": "ETHUSDT", "event_time": "2026-11-19T13:56:06.917598+00:00", "price": 9999.99}
+replayed 1 message(s) to crypto.prices
+```
+
+The message was re-validated, passed, windowed and committed to the warehouse:
+
+```
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c \
+   "select symbol, window_start, round(max_price::numeric,2) max_price, tick_count
+    from raw.price_windows where symbol='ETHUSDT' and max_price > 9000
+    order by window_start desc limit 5;"
+ symbol  |    window_start     | max_price | tick_count
+---------+---------------------+-----------+------------
+ ETHUSDT | 2026-11-19 13:56:00 |   9999.99 |         61
+(1 row)
+```
+
+Baseline for the same query before replay was `280|2026-11-19 13:56:00` for count/max window;
+the 9999.99 value only exists because of the repaired replay.
+
+## 2.5 PROOF 3 — sink failure quarantines the batch and the stream recovers
+
+Baseline before stopping the warehouse:
+
+```
+> python scripts/lake_ls.py raw/ticks/ 500 | Select-Object -Last 1
+-- 218 object(s) (truncated=False)
+> psql -tAc "select count(*), max(window_start) from raw.price_windows;"
+280|2026-11-19 13:56:00
+```
+
+Stop the warehouse, then inject two more bad messages while it is down:
+
+```
+> docker compose stop warehouse
+ Container streaming-pipeline-warehouse-1 Stopped
+> kafka-console-producer ... < /tmp/bad2.txt
+producer_exit=0
+```
+
+### Quarantine
+
+```
+> python scripts/lake_ls.py dead_letter/sink_failures 100
+         0  2026-11-19 14:01:33  s3://datalake/dead_letter/sink_failures/batch_id=111/_SUCCESS
+       938  2026-11-19 14:01:33  s3://datalake/dead_letter/sink_failures/batch_id=111/part-00000-0f68ee35-...parquet
+       938  2026-11-19 14:00:11  s3://datalake/dead_letter/sink_failures/batch_id=111/part-00000-46c10526-...parquet
+       ...
+-- 19 object(s) (truncated=False)
+```
+
+The repeated files are the same batch being retried every 30 s; each attempt quarantines before
+re-raising. Driver log:
+
+```
+2026-11-19 14:01:32,086 ERROR spark.streaming - batch 111 failed to reach Postgres; quarantining to the lake
+2026-11-19 14:01:48,876 ERROR spark.streaming - batch 111 failed to reach Postgres; quarantining to the lake
+2026-11-19 14:02:08,658 ERROR spark.streaming - batch 111 failed to reach Postgres; quarantining to the lake
+2026-11-19 14:02:26,170 ERROR spark.streaming - batch 111 failed to reach Postgres; quarantining to the lake
+```
+
+### The stream does not wedge
+
+While the warehouse was down, the independent streams kept processing:
+
+```
+> python scripts/lake_ls.py raw/ticks/ 500 | Select-Object -Last 1
+-- 226 object(s) (truncated=False)        # was 218
+
+> python scripts/replay_dlq.py --dry-run --limit 10
+[unparseable_json] offset=16070 -> not json at all
+[invalid_event_time] offset=16071 -> {"symbol": "BTCUSDT", ...}
+[missing_price] offset=16072 -> {"symbol": "ETHUSDT", ...}
+[unparseable_json] offset=17199 -> not json at all
+[invalid_event_time] offset=17200 -> {"symbol": "BTCUSDT", ...}
+```
+
+Two brand-new dead letters (offsets 17199/17200) landed during the outage. The JDBC failure does
+terminate the `windows` query (that is what makes Spark retry the batch) and `restart: on-failure`
+brings the whole app back; no data is lost because the batch stays in the checkpoint and in the
+quarantine.
+
+A side effect was found and fixed: `replay_dlq.py` was also reading the quarantined window
+batches as dead letters and printing `[nan] offset=nan -> nan`. It now excludes keys containing
+`/sink_failures/`. After the fix the listing above is clean.
+
+### Recovery
+
+```
+> docker compose start warehouse
+ Container streaming-pipeline-warehouse-1 Started
+> docker compose logs --timestamps spark | Select-String "batch [0-9]+ written to Postgres|quarantining"
+2026-11-19 14:03:15,739 ERROR spark.streaming - batch 111 failed to reach Postgres; quarantining to the lake
+2026-11-19 14:03:34,600 INFO spark.streaming - batch 111 written to Postgres
+2026-11-19 14:03:36,643 INFO spark.streaming - batch 112 written to Postgres
+2026-11-19 14:04:01,346 INFO spark.streaming - batch 113 written to Postgres
+2026-11-19 14:04:31,180 INFO spark.streaming - batch 114 written to Postgres
+
+> psql -c "select count(*) as windows, max(window_start) as latest from raw.price_windows;"
+ windows |       latest
+---------+---------------------
+     305 | 2026-11-19 14:01:00
+(1 row)
+```
+
+The stuck batch 111 was written first, then normal batches resumed. Window count grew 280 -> 305
+and the latest window advanced from 13:56:00 to 14:01:00. Both services are healthy at the end.
+
+## 2.6 Regression tests
+
+```
+> docker compose run --rm --no-deps -v "${PWD}/tests:/app/tests" -v "${PWD}/dbt:/app/dbt" \
+    producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q"
+............                                                             [100%]
+12 passed in 0.77s
+```
+
+No test was weakened or deleted.
+
+The app image was rebuilt so the deployed `replay_dlq.py` contains the `/sink_failures/` fix:
+
+```
+> docker compose build producer
+ Image streaming-pipeline-app:1.0.0 Built
+> docker compose up -d
+> docker compose run --rm --no-deps producer python scripts/replay_dlq.py --dry-run --limit 10
+[unparseable_json] offset=16070 -> not json at all
+[invalid_event_time] offset=16071 -> {"symbol": "BTCUSDT", ...}
+[missing_price] offset=16072 -> {"symbol": "ETHUSDT", ...}
+[unparseable_json] offset=17199 -> not json at all
+[invalid_event_time] offset=17200 -> {"symbol": "BTCUSDT", ...}
+```
+
+Final state: all nine services up, Spark still writing windows (`batch 127 written to Postgres`).
+
+## 2.7 Phase 2 status
+
+- [x] `unparseable_json` / `invalid_event_time` dead letters with reason + offset
+- [x] `replay_dlq.py --set price=9999.99` repairs a tick and it reaches the stream/warehouse
+- [x] sink failure quarantines to `dead_letter/sink_failures/`, other streams keep running,
+      and the stuck batch is committed after the warehouse restarts
+- [x] 12 unit tests pass
 
 ## Session-side notes
 
-- Test file used for bad messages:
-  `C:\Users\DELL\AppData\Local\Temp\opencode\bad_messages.txt`
+- Bad-message files used: `C:\Users\DELL\AppData\Local\Temp\opencode\bad_messages_phase2_v2.txt`
+  and the `produce_all_bad.py` helper (current event time).
+- Diagnostic Spark classifier script:
+  `C:\Users\DELL\AppData\Local\Temp\opencode\diag_classifier.py`.
+- Old dead-letter rows were copied to `dead_letter_evidence_backup/` in the lake before each
+  checkpoint reset.
 - Local git identity is `Pipeline Dev <dev@localhost>` (repo-local only).
-- Docker Hub is intermittently slow on this machine: pulls must be retried (a 5-attempt loop
-  was enough every time).
-
-
+- Docker Hub is intermittently slow on this machine; pulls may need a few retries.
