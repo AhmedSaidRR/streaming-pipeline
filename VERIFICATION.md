@@ -593,3 +593,333 @@ Final state: all nine services up, Spark still writing windows (`batch 127 writt
   checkpoint reset.
 - Local git identity is `Pipeline Dev <dev@localhost>` (repo-local only).
 - Docker Hub is intermittently slow on this machine; pulls may need a few retries.
+
+---
+
+## Phase 3 — metrics (measurement only)
+
+All commands below were run on 2026-11-19. Host local time is UTC+2; container/database log
+timestamps are UTC. Nothing was committed. No code, test or Docker files were changed. No
+command printed a credential, so there is nothing to mask with `***` in this section (the S3
+client reads its keys from the environment and never echoes them). ANSI colour codes from dbt
+output were stripped for readability; the text is otherwise verbatim.
+
+### 3.0 Baseline
+
+```
+> git status --short
+(no output — clean working tree)
+
+> git log -1 --oneline
+93b141a feat(dlq): prove dead-letter reasons, replay repair and sink-failure recovery
+
+> docker compose ps
+NAME                                     IMAGE                                                                                         COMMAND                  SERVICE             CREATED          STATUS                       PORTS
+streaming-pipeline-airflow-db-1          postgres:16.16                                                                                "docker-entrypoint.s…"   airflow-db          13 hours ago     Up About an hour (healthy)   5432/tcp
+streaming-pipeline-airflow-scheduler-1   streaming-pipeline-airflow:2.10.5-dbt1.11                                                     "/usr/bin/dumb-init …"   airflow-scheduler   13 hours ago     Up About an hour (healthy)   8080/tcp
+streaming-pipeline-airflow-webserver-1   streaming-pipeline-airflow:2.10.5-dbt1.11                                                     "/usr/bin/dumb-init …"   airflow-webserver   13 hours ago     Up About an hour (healthy)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+streaming-pipeline-dashboard-1           streaming-pipeline-app:1.0.0                                                                  "streamlit run dashb…"   dashboard           50 minutes ago   Up 50 minutes (healthy)      0.0.0.0:8501->8501/tcp, [::]:8501->8501/tcp
+streaming-pipeline-kafka-1               apache/kafka:3.8.0                                                                            "/__cacert_entrypoin…"   kafka               13 hours ago     Up About an hour (healthy)   9092/tcp
+streaming-pipeline-lake-1                chrislusf/seaweedfs@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15   "/entrypoint.sh serv…"   lake                13 hours ago     Up About an hour (healthy)   0.0.0.0:8333->8333/tcp, [::]:8333->8333/tcp, 0.0.0.0:8888->8888/tcp, [::]:8888->8888/tcp, 0.0.0.0:9333->9333/tcp, [::]:9333->9333/tcp
+streaming-pipeline-producer-1            streaming-pipeline-app:1.0.0                                                                  "python -m producer.…"   producer            50 minutes ago   Up 50 minutes
+streaming-pipeline-spark-1               streaming-pipeline-spark:3.5.3                                                                "/opt/entrypoint.sh …"   spark               13 hours ago     Up 57 minutes
+streaming-pipeline-warehouse-1           postgres:16.16                                                                                "docker-entrypoint.s…"   warehouse           13 hours ago     Up 57 minutes (healthy)      0.0.0.0:5433->5432/tcp, [::]:5433->5432/tcp
+
+> docker compose exec -T airflow-webserver airflow dags list
+dag_id              | fileloc                                 | owners  | is_paused
+====================+=========================================+=========+==========
+streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+```
+
+### 3.1 Pause the DAG
+
+```
+> docker compose exec -T airflow-webserver airflow dags pause streaming_analytics
+dag_id              | is_paused
+====================+==========
+streaming_analytics | True
+
+> docker compose exec -T airflow-webserver airflow dags list
+dag_id              | fileloc                                 | owners  | is_paused
+====================+=========================================+=========+==========
+streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | True
+```
+
+### 3.2 Throughput — simulated, N=505
+
+`$env:SIM_EXTRA_SYMBOLS='500'` is set in the same PowerShell invocation as the recreate, because
+each tool call is a fresh shell. `SYMBOLS` already has 5 base symbols, so 5 + 500 = 505.
+
+```
+> $env:SIM_EXTRA_SYMBOLS='500'; docker compose up -d --force-recreate --no-deps producer
+ Container streaming-pipeline-producer-1 Recreate
+ Container streaming-pipeline-producer-1 Recreated
+ Container streaming-pipeline-producer-1 Starting
+ Container streaming-pipeline-producer-1 Started
+SIM_EXTRA_SYMBOLS=500
+```
+
+`kafka.tools.GetOffsetShell` is absent from `apache/kafka:3.8.0`, so the end offset was read with
+the bundled `kafka-get-offsets.sh` (`-1` = latest/end offset by default):
+
+```
+> docker compose exec -T kafka /opt/kafka/bin/kafka-run-class.sh kafka.tools.GetOffsetShell --broker-list kafka:9092 --topic crypto.prices -time -1
+Error: Could not find or load main class kafka.tools.GetOffsetShell
+Caused by: java.lang.ClassNotFoundException: kafka.tools.GetOffsetShell
+
+> docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic crypto.prices
+crypto.prices:0:61511
+```
+
+The producer's own counter confirms 505 events per 1-second poll (increment 505 each line):
+
+```
+> docker compose logs --tail 8 producer
+producer-1  | 2026-11-19 15:01:50,506 INFO producer - sent=2525 rejected=0
+producer-1  | 2026-11-19 15:01:51,514 INFO producer - sent=3030 rejected=0
+producer-1  | 2026-11-19 15:01:52,502 INFO producer - sent=3535 rejected=0
+producer-1  | 2026-11-19 15:01:53,502 INFO producer - sent=4040 rejected=0
+producer-1  | 2026-11-19 15:01:54,512 INFO producer - sent=4545 rejected=0
+producer-1  | 2026-11-19 15:01:55,513 INFO producer - sent=5050 rejected=0
+producer-1  | 2026-11-19 15:01:56,501 INFO producer - sent=5555 rejected=0
+producer-1  | 2026-11-19 15:01:57,502 INFO producer - sent=6060 rejected=0
+```
+
+Measurement 1 — Kafka end-offset delta over a 60 s sleep (the extra ~1.7 s is the JVM startup of
+the two `docker compose exec kafka ...` calls, so elapsed is reported as well as nominal):
+
+```
+$t0 = Get-Date -Format "yyyy-MM-ddTHH:mm:ss.fff"
+$o0raw = docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic crypto.prices
+$o0 = [int]($o0raw.Trim().Split(':')[-1])
+Start-Sleep -Seconds 60
+$t1 = Get-Date -Format "yyyy-MM-ddTHH:mm:ss.fff"
+$o1raw = docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic crypto.prices
+$o1 = [int]($o1raw.Trim().Split(':')[-1])
+$delta = $o1 - $o0
+$elapsed = (...).TotalSeconds
+
+t0=2026-11-19T17:03:00.728
+offset_t0_raw=crypto.prices:0:74136
+offset_t0=74136
+t1=2026-11-19T17:04:02.455
+offset_t1_raw=crypto.prices:0:105446
+offset_t1=105446
+delta=31310
+elapsed_sec=61.727
+events_per_sec_nominal=521.833333333333
+events_per_sec_actual=507.23
+```
+
+Measurement 2 — same 60 s sleep, cross-checked against the producer counter read in the same
+window (this is the number used in the Results table):
+
+```
+function Get-KafkaEnd { $r = docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:9092 --topic crypto.prices; return [int]($r.Trim().Split(':')[-1]) }
+function Get-ProducerSent { $l = docker compose logs --tail 6 producer | Select-String "sent=" | Select-Object -Last 1; if ($l -match 'sent=(\d+)') { return [int]$Matches[1] } else { return -1 } }
+$ko0 = Get-KafkaEnd; $ps0 = Get-ProducerSent; $tw0 = Get-Date
+Start-Sleep -Seconds 60
+$ko1 = Get-KafkaEnd; $ps1 = Get-ProducerSent; $tw1 = Get-Date
+$elapsed = ($tw1-$tw0).TotalSeconds
+
+t0=17:04:57.567 kafka_end=132211 producer_sent=96960
+t1=17:05:59.288 kafka_end=163521 producer_sent=127765
+kafka_delta=31310 producer_delta=30805 elapsed=61.7208793
+kafka_events_per_sec=507.28 producer_events_per_sec=499.1
+```
+
+Result: **~507 events/s** from the Kafka end-offset delta (31,310 events / 61.72 s), consistent
+with the producer's configured 505 ticks/s. The nominal `delta / 60` = 521.8 is inflated by the
+~1.7 s JVM exec overhead inside the 60 s window, so the elapsed-time rate is the reported one.
+
+### 3.3 End-to-end latency — probe tick
+
+One tick with a known `event_time` (current UTC minus 5 s) was written to a host temp file, copied
+into the Kafka container with `docker compose cp` and produced from the file (a PowerShell pipe
+had previously been unreliable — see 2.1). The probe symbol is unique, so it gets its own
+warehouse row.
+
+```
+> $et = (Get-Date).ToUniversalTime().AddSeconds(-5)
+> $etStr = $et.ToString("yyyy-MM-ddTHH:mm:ss.ffffff+00:00")
+> $json = '{"symbol": "LATENCYPROBEUSDT", "price": 12345.67, "event_time": "' + $etStr + '", "source": "probe"}'
+> Set-Content -Path $probePath -Value $json -Encoding ascii
+probe_file=C:\Users\DELL\AppData\Local\Temp\latency_probe_phase3.txt
+event_time=2026-11-19T15:06:44.368926+00:00
+payload={"symbol": "LATENCYPROBEUSDT", "price": 12345.67, "event_time": "2026-11-19T15:06:44.368926+00:00", "source": "probe"}
+
+> docker compose cp $probePath kafka:/tmp/latency_probe.txt
+ streaming-pipeline-kafka-1 Copied C:\Users\DELL\AppData\Local\Temp\latency_probe_phase3.txt to streaming-pipeline-kafka-1:/tmp/latency_probe.txt
+> docker compose exec -T kafka sh -c "/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic crypto.prices < /tmp/latency_probe.txt"
+producer_exit=0
+```
+
+Polled the warehouse every 15 s until the row appeared (host time; database timestamps UTC):
+
+```
+poll=1 at=17:07:00 not-yet
+poll=2 at=17:07:15 not-yet
+poll=3 at=17:07:31 not-yet
+poll=4 at=17:07:46 not-yet
+poll=5 at=17:08:01 not-yet
+poll=6 at=17:08:16 not-yet
+poll=7 at=17:08:32 not-yet
+poll=8 at=17:08:47 not-yet
+poll=9 found_at=17:09:02
+row=LATENCYPROBEUSDT|2026-11-19 15:06:00|12345.67|1|2026-11-19 15:09:00.01
+found=True
+
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "select symbol, window_start, window_end, avg_price, tick_count, ingested_at, extract(epoch from (ingested_at - timestamp '2026-11-19 15:06:44.368926')) as latency_sec from raw.price_windows where symbol='LATENCYPROBEUSDT' order by ingested_at desc limit 1;"
+      symbol      |    window_start     |     window_end      | avg_price | tick_count |      ingested_at       | latency_sec
+------------------+---------------------+---------------------+-----------+------------+------------------------+-------------
+ LATENCYPROBEUSDT | 2026-11-19 15:06:00 | 2026-11-19 15:07:00 |  12345.67 |          1 | 2026-11-19 15:09:00.01 |  135.641074
+(1 row)
+
+latency_sec_powershell=135.641074
+```
+
+Result: **135.641074 s** (2 m 15.6 s) from `event_time` to `ingested_at`. This matches the design
+in 0.6: 1-minute watermark + 30 s trigger + JDBC write, plus the 5 s deliberately added to
+`event_time`.
+
+### 3.4 Restore
+
+```
+> Remove-Item Env:SIM_EXTRA_SYMBOLS -ErrorAction SilentlyContinue
+> Write-Output "SIM_EXTRA_SYMBOLS_after_remove=$env:SIM_EXTRA_SYMBOLS"
+SIM_EXTRA_SYMBOLS_after_remove=
+> docker compose up -d --force-recreate --no-deps producer
+ Container streaming-pipeline-producer-1 Recreate
+ Container streaming-pipeline-producer-1 Recreated
+ Container streaming-pipeline-producer-1 Starting
+ Container streaming-pipeline-producer-1 Started
+> docker compose exec -T producer printenv SIM_EXTRA_SYMBOLS
+0
+> docker compose exec -T airflow-webserver airflow dags unpause streaming_analytics
+dag_id              | is_paused
+====================+==========
+streaming_analytics | False
+
+> docker compose ps --format "table {{.Service}}\t{{.Status}}"
+SERVICE             STATUS
+airflow-db          Up 2 hours (healthy)
+airflow-scheduler   Up 2 hours (healthy)
+airflow-webserver   Up 2 hours (healthy)
+dashboard           Up 59 minutes (healthy)
+kafka               Up 2 hours (healthy)
+lake                Up 2 hours (healthy)
+producer            Up 11 seconds
+spark               Up About an hour
+warehouse           Up About an hour (healthy)
+
+> docker compose exec -T airflow-webserver airflow dags list
+dag_id              | fileloc                                 | owners  | is_paused
+====================+=========================================+=========+==========
+streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+```
+
+Nine services up, DAG unpaused, producer back to `SIM_EXTRA_SYMBOLS=0` (N=5).
+
+### 3.5 Window count and lake footprint
+
+```
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "select count(*) as windows, min(window_start) as first_window, max(window_start) as last_window from raw.price_windows;"
+ windows |    first_window     |     last_window
+---------+---------------------+---------------------
+    4136 | 2026-11-19 02:16:00 | 2026-11-19 15:07:00
+(1 row)
+```
+
+Paginated `list_objects_v2` over `raw/ticks/` (the repo's `lake_ls.py` is single-page, so an
+inline read against the same `scripts/s3_client.py` was used to get all 366 objects):
+
+```
+> docker compose run --rm --no-deps -v "${PWD}/scripts:/app/scripts" producer python -c "import sys; sys.path.insert(0,'/app/scripts'); from s3_client import make_client,bucket_name; c=make_client(); b=bucket_name(); pg=c.get_paginator('list_objects_v2'); objs=[]; [objs.extend(p.get('Contents',[])) for p in pg.paginate(Bucket=b,Prefix='raw/ticks/')]; data=[o for o in objs if '_spark_metadata/' not in o['Key']]; meta=[o for o in objs if '_spark_metadata/' in o['Key']]; print('objects_total',len(objs)); print('objects_data_parquet',len(data)); print('objects_metadata',len(meta)); print('bytes_total',sum(o['Size'] for o in objs)); print('bytes_data_parquet',sum(o['Size'] for o in data)); print('oldest',min(o['LastModified'] for o in objs)); print('newest',max(o['LastModified'] for o in objs))"
+objects_total 366
+objects_data_parquet 262
+objects_metadata 104
+bytes_total 5093976
+bytes_data_parquet 4514829
+oldest 2026-11-19 02:17:04+00:00
+newest 2026-11-19 15:10:00+00:00
+
+> (computation from those two timestamps and bytes_total)
+observed_span_hours=12.882222
+observed_bytes=5093976
+observed_mib=4.858
+rate_bytes_per_hour=395426.8
+projected_24h_bytes=9490243
+projected_24h_mib=9.051
+```
+
+**This is a projection, not a measured 24-hour figure.** 5,093,976 B (4.858 MiB) observed over
+12.88 h, linearly projected to ~9.05 MiB / 24 h (parquet data alone: 4,514,829 B). The observed
+window includes the ~4-minute N=505 throughput test, so the per-hour rate is slightly inflated;
+the real steady-state 24 h figure should be lower.
+
+### 3.6 dbt test
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-webserver /home/airflow/dbt_venv/bin/dbt test --profiles-dir /opt/airflow/dbt
+15:10:42  Running with dbt=1.11.0
+15:10:42  Registered adapter: postgres=1.11.0
+15:10:43  Found 6 models, 1 snapshot, 15 data tests, 1 seed, 1 source, 479 macros
+15:10:43  Concurrency: 2 threads (target='dev')
+15:10:43  1 of 15 START test assert_min_le_avg_le_max .................................... [RUN]
+15:10:43  2 of 15 START test assert_prices_positive ...................................... [RUN]
+15:10:43  1 of 15 PASS assert_min_le_avg_le_max .......................................... [PASS in 0.09s]
+15:10:43  2 of 15 PASS assert_prices_positive ............................................ [PASS in 0.09s]
+15:10:43  3 of 15 START test assert_stg_unique_symbol_window ............................. [RUN]
+15:10:43  4 of 15 START test not_null_dim_symbol_asset_class ............................. [RUN]
+15:10:43  4 of 15 PASS not_null_dim_symbol_asset_class ................................... [PASS in 0.06s]
+15:10:43  5 of 15 START test not_null_dim_symbol_symbol .................................. [RUN]
+15:10:43  3 of 15 PASS assert_stg_unique_symbol_window ................................... [PASS in 0.07s]
+15:10:43  6 of 15 START test not_null_dim_symbol_symbol_key .............................. [RUN]
+15:10:43  5 of 15 PASS not_null_dim_symbol_symbol ........................................ [PASS in 0.06s]
+15:10:43  6 of 15 PASS not_null_dim_symbol_symbol_key .................................... [PASS in 0.04s]
+15:10:43  7 of 15 START test not_null_fct_price_1m_symbol_key ............................ [RUN]
+15:10:43  8 of 15 START test not_null_mart_hourly_prices_symbol .......................... [RUN]
+15:10:43  7 of 15 PASS not_null_fct_price_1m_symbol_key .................................. [PASS in 0.05s]
+15:10:43  8 of 15 PASS not_null_mart_hourly_prices_symbol ................................. [PASS in 0.05s]
+15:10:43  9 of 15 START test not_null_mart_symbol_history_valid_from ..................... [RUN]
+15:10:43  10 of 15 START test not_null_stg_price_windows_avg_price ....................... [RUN]
+15:10:43  9 of 15 PASS not_null_mart_symbol_history_valid_from ........................... [PASS in 0.06s]
+15:10:43  11 of 15 START test not_null_stg_price_windows_symbol .......................... [RUN]
+15:10:43  10 of 15 PASS not_null_stg_price_windows_avg_price ............................. [PASS in 0.07s]
+15:10:43  12 of 15 START test not_null_stg_price_windows_window_start .................... [RUN]
+15:10:43  11 of 15 PASS not_null_stg_price_windows_symbol ................................ [PASS in 0.06s]
+15:10:43  13 of 15 START test relationships_fct_price_1m_symbol_key__symbol_key__ref_dim_symbol_  [RUN]
+15:10:43  12 of 15 PASS not_null_stg_price_windows_window_start .......................... [PASS in 0.05s]
+15:10:43  14 of 15 START test unique_dim_symbol_symbol ................................... [RUN]
+15:10:43  14 of 15 PASS unique_dim_symbol_symbol ......................................... [PASS in 0.05s]
+15:10:43  13 of 15 PASS relationships_fct_price_1m_symbol_key__symbol_key__ref_dim_symbol_  [PASS in 0.06s]
+15:10:43  15 of 15 START test unique_dim_symbol_symbol_key ............................... [RUN]
+15:10:43  15 of 15 PASS unique_dim_symbol_symbol_key ..................................... [PASS in 0.05s]
+15:10:43  Finished running 15 data tests in 0 hours 0 minutes and 0.73 seconds (0.73s).
+15:10:43  Completed successfully
+15:10:43  Done. PASS=15 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=15
+```
+
+### 3.7 Unit tests
+
+```
+> docker compose run --rm --no-deps -v "${PWD}/tests:/app/tests" -v "${PWD}/dbt:/app/dbt" producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q"
+ Container streaming-pipeline-producer-run-9b459a7bf123 Creating
+ Container streaming-pipeline-producer-run-9b459a7bf123 Created
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+[notice] A new release of pip is available: 24.0 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+............                                                             [100%]
+12 passed in 0.99s
+```
+
+### 3.8 Phase 3 status
+
+- [x] DAG paused, N=505 throughput measured from Kafka end offsets, DAG unpaused and restored
+- [x] Probe tick with known `event_time` reached `raw.price_windows`; latency computed
+- [x] 9 services up after restore
+- [x] Window count and lake footprint measured; 24 h figure explicitly labelled a projection
+- [x] dbt test: 15 passed
+- [x] Unit tests: 12 passed
+- [x] No commit made; only this file and the README Results table edited

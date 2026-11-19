@@ -108,12 +108,12 @@ dbt tests run inside Airflow (`dbt test`): not_null, unique, relationships, plus
 ## Results (fill in after your own run)
 | Metric | Value |
 |---|---|
-| Events/sec (simulated, N symbols) | |
-| End-to-end latency (event -> warehouse) | |
-| Raw data in lake after 24h | |
-| 1-minute windows in warehouse | |
-| dbt tests passed | |
-| Unit tests | |
+| Events/sec (simulated, N symbols) | ~507 events/s (N=505; Kafka end-offset delta 31,310 over 61.72 s; producer logs +505/s) |
+| End-to-end latency (event -> warehouse) | 135.641074 s (2 m 15.6 s), probe `LATENCYPROBEUSDT`, `event_time` 15:06:44.368926 UTC -> `ingested_at` 15:09:00.01 UTC |
+| Raw data in lake after 24h | ~9.05 MiB **projection** (5,093,976 B / 4.858 MiB observed over 12.88 h under `raw/ticks/`; not a measured 24 h figure; includes ~4 min of N=505 load) |
+| 1-minute windows in warehouse | 4,136 (first 02:16:00, last 15:07:00 UTC) |
+| dbt tests passed | 15 (PASS=15, WARN=0, ERROR=0, TOTAL=15) |
+| Unit tests | 12 passed in 0.99s |
 
 Add screenshots: Airflow DAG green, dashboard, lake bucket.
 
