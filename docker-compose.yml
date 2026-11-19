@@ -18,29 +18,37 @@ services:
     volumes:
       - kafka_data:/var/lib/kafka/data
 
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  # S3-compatible object store (data lake). MinIO's free images were removed from
+  # Docker Hub and dl.min.io (404 / 410 / quay 401), so the lake runs on SeaweedFS.
+  lake:
+    # Pinned by digest: the repo publishes no semantic version tags.
+    image: chrislusf/seaweedfs@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15
+    command: >
+      server -dir=/data -s3 -s3.port=8333
+      -s3.config=/etc/seaweedfs/s3.json
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "8333:8333"   # S3 API
+      - "8888:8888"   # filer UI (browse the lake)
+      - "9333:9333"   # master UI
     volumes:
-      - minio_data:/data
+      - lake_data:/data
+      - ./infra/seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9333/cluster/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
 
-  minio-init:
-    image: minio/mc:latest
-    depends_on: [minio]
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      MINIO_BUCKET: ${MINIO_BUCKET}
-    entrypoint: >
-      /bin/sh -c "
-      until mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do sleep 2; done;
-      mc mb -p local/$$MINIO_BUCKET; exit 0"
+  lake-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    command: python scripts/init_lake.py
+    env_file: .env
+    depends_on:
+      lake:
+        condition: service_healthy
+    restart: "no"
 
   warehouse:
     image: postgres:16
@@ -66,7 +74,13 @@ services:
   spark:
     image: apache/spark:3.5.3-scala2.12-java17-python3-ubuntu
     user: root
-    depends_on: [kafka, minio-init, warehouse]
+    depends_on:
+      kafka: 
+        condition: service_started
+      lake-init:
+        condition: service_completed_successfully
+      warehouse:
+        condition: service_started
     env_file: .env
     restart: on-failure
     volumes:
@@ -119,7 +133,7 @@ services:
 
 volumes:
   kafka_data:
-  minio_data:
+  lake_data:
   warehouse_data:
   airflow_meta:
   spark_checkpoints:

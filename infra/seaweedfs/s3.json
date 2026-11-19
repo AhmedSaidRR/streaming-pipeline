@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "pipeline",
+      "credentials": [
+        {
+          "accessKey": "lakeadmin",
+          "secretKey": "lakeadmin123"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

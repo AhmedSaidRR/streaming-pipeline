@@ -1,9 +1,9 @@
 """Spark Structured Streaming job.
 
 Kafka (crypto.prices) -> validate
-  |-- valid ticks   -> MinIO Parquet  (raw data lake, partitioned by date)
+  |-- valid ticks   -> S3 lake Parquet  (raw data lake, partitioned by date)
   |-- valid ticks   -> 1-minute tumbling window per symbol -> PostgreSQL raw.price_windows
-  |-- invalid msgs  -> MinIO dead_letter/ (never silently dropped)
+  |-- invalid msgs  -> S3 dead_letter/ (never silently dropped)
 """
 import os
 
@@ -11,7 +11,8 @@ from pyspark.sql import SparkSession, functions as F, types as T
 
 KAFKA = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "crypto.prices")
-BUCKET = os.getenv("MINIO_BUCKET", "datalake")
+BUCKET = os.getenv("S3_BUCKET", "datalake")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://lake:8333")
 CKPT = "/checkpoints"
 TRIGGER = "30 seconds"
 
@@ -33,11 +34,13 @@ def build_spark() -> SparkSession:
     return (SparkSession.builder.appName("crypto-streaming")
             .config("spark.sql.session.timeZone", "UTC")
             .config("spark.sql.shuffle.partitions", "4")
-            .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
-            .config("spark.hadoop.fs.s3a.access.key", os.getenv("MINIO_ROOT_USER", "minioadmin"))
-            .config("spark.hadoop.fs.s3a.secret.key", os.getenv("MINIO_ROOT_PASSWORD", "minioadmin123"))
+            .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT)
+            .config("spark.hadoop.fs.s3a.access.key", os.getenv("S3_ACCESS_KEY", "lakeadmin"))
+            .config("spark.hadoop.fs.s3a.secret.key", os.getenv("S3_SECRET_KEY", "lakeadmin123"))
             .config("spark.hadoop.fs.s3a.path.style.access", "true")
             .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+            .config("spark.hadoop.fs.s3a.change.detection.mode", "none")
+            .config("spark.hadoop.fs.s3a.change.detection.version.required", "false")
             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
             .getOrCreate())
 

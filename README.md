@@ -1,6 +1,6 @@
 # Real-Time Crypto Price Streaming Pipeline
 
-End-to-end streaming data engineering project: **Kafka -> Spark Structured Streaming -> MinIO (data lake) + PostgreSQL -> dbt -> Airflow -> Streamlit**.
+End-to-end streaming data engineering project: **Kafka -> Spark Structured Streaming -> S3-compatible lake (SeaweedFS) + PostgreSQL -> dbt -> Airflow -> Streamlit**.
 
 It reads live prices from the public Binance API (or a built-in simulator), streams them through Kafka, aggregates them into 1-minute windows with Spark, lands raw data in an S3-compatible lake, models it with dbt, and monitors freshness and quality with Airflow.
 
@@ -11,8 +11,8 @@ flowchart LR
     A[Binance API / Simulator] --> B[Python Producer]
     B -->|JSON ticks| C[(Kafka: crypto.prices)]
     C --> D[Spark Structured Streaming]
-    D -->|valid ticks, Parquet| E[(MinIO datalake/raw)]
-    D -->|invalid messages| F[(MinIO dead_letter)]
+    D -->|valid ticks, Parquet| E[(S3 lake: datalake/raw)]
+    D -->|invalid messages| F[(S3 lake: dead_letter)]
     D -->|1-min windows| G[(PostgreSQL raw.price_windows)]
     G --> H[dbt: staging -> marts]
     I[Airflow every 5 min] -->|freshness check, dbt run, dbt test| H
@@ -39,7 +39,7 @@ erDiagram
 Grain of `fct_price_1m`: **one row per symbol per 1-minute window**. Also: `mart_hourly_prices` (OHLC-style) and `mart_volatility_alerts`.
 
 ## Stack
-Kafka (KRaft) · Spark 3.5 Structured Streaming · MinIO (S3 API) · PostgreSQL 16 · dbt-postgres · Apache Airflow 2.10 · Streamlit · Docker Compose · pytest · ruff · GitHub Actions
+Kafka (KRaft) · Spark 3.5 Structured Streaming · SeaweedFS (S3 API) · PostgreSQL 16 · dbt-postgres · Apache Airflow 2.10 · Streamlit · Docker Compose · pytest · ruff · GitHub Actions
 
 ## Quick start
 
@@ -51,8 +51,7 @@ docker compose up -d --build
 | What | Where |
 |---|---|
 | Airflow (admin / admin) | http://localhost:8080 |
-| MinIO console (see .env) | http://localhost:9001 |
-| Dashboard | http://localhost:8501 |
+| Lake UI (SeaweedFS filer) | http://localhost:8888 || Dashboard | http://localhost:8501 |
 | Warehouse (psql) | `docker compose exec warehouse psql -U warehouse -d warehouse` (host port 5433) |
 
 1. Wait ~2-3 minutes (Spark downloads its Kafka/S3/JDBC packages on first start). Check: `docker compose logs -f spark`.
@@ -96,7 +95,7 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-producer.sh \
 # type:  {"symbol":"BTCUSDT","price":-5,"event_time":"2026-11-19T10:00:00+00:00"}
 # type:  not json at all
 ```
-After ~30 s both messages appear under `datalake/dead_letter/` in MinIO, and the valid stream is unaffected.
+After ~30 s both messages appear under `datalake/dead_letter/` in the lake, and the valid stream is unaffected.
 
 ## Tests
 ```bash
@@ -116,7 +115,7 @@ dbt tests run inside Airflow (`dbt test`): not_null, unique, relationships, plus
 | dbt tests passed | |
 | Unit tests | |
 
-Add screenshots: Airflow DAG green, dashboard, MinIO bucket.
+Add screenshots: Airflow DAG green, dashboard, lake bucket.
 
 ## Roadmap
 - [x] SCD Type 2 on symbol attributes (dbt snapshot), see below
