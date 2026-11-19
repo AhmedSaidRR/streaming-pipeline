@@ -54,14 +54,14 @@ docker compose up -d --build
 | Lake UI (SeaweedFS filer) | http://localhost:8888 || Dashboard | http://localhost:8501 |
 | Warehouse (psql) | `docker compose exec warehouse psql -U warehouse -d warehouse` (host port 5433) |
 
-1. Wait ~2-3 minutes (Spark downloads its Kafka/S3/JDBC packages on first start). Check: `docker compose logs -f spark`.
+1. Wait ~30 s for a cold start (Spark's Kafka/S3/JDBC jars are baked into the image at build time; no Maven/Ivy download on first start). Check: `docker compose logs -f spark`.
 2. In Airflow, unpause `streaming_analytics`. It runs every 5 minutes: freshness check -> `dbt seed` -> `dbt snapshot` -> `dbt run` -> `dbt test`.
 3. Open the dashboard.
 
 If Binance is blocked in your region, set `SOURCE=simulated` in `.env` and run `docker compose up -d --force-recreate producer`.
 
 ### Throughput test
-Set `SOURCE=simulated` and `SIM_EXTRA_SYMBOLS=500` to generate ~500 events/sec, then record the numbers in the Results table.
+Set `SOURCE=simulated` and `SIM_EXTRA_SYMBOLS=500` to generate ~505 events/sec (5 base symbols + 500 extra), then record the numbers in the Results table.
 
 ## SCD Type 2 demo (slowly changing dimension)
 
@@ -81,7 +81,7 @@ You should see two rows: the old version with a `valid_to`, and the new current 
 - **Kafka as the buffer:** the producer and the processing job are decoupled; Spark can restart and resume from its checkpoint.
 - **Idempotent producer** (`enable.idempotence`, `acks=all`) avoids duplicates on retry.
 - **Event-time windows + 1-minute watermark:** late data is handled by event time, not arrival time.
-- **At-least-once into Postgres, dedupe in dbt:** after a Spark restart a window can be written twice. `stg_price_windows` keeps the latest row per (symbol, window_start) and a dbt test proves uniqueness.
+- **At-least-once into Postgres, dedupe in dbt:** after a Spark restart a window can be written twice. `stg_price_windows` keeps the latest row per (symbol, window_start); a source-level dbt test warns if the raw table contains duplicate (symbol, window_start) rows.
 - **Dead-letter storage:** malformed or invalid messages are written to `dead_letter/` in the lake instead of being dropped.
 - **Raw ticks kept in Parquet (partitioned by date):** the lake is the source of truth, so the warehouse can be rebuilt.
 - **dbt in its own venv inside the Airflow image:** avoids dependency conflicts with Airflow.
@@ -109,8 +109,8 @@ dbt tests run inside Airflow (`dbt test`): not_null, unique, relationships, plus
 | Metric | Value |
 |---|---|
 | Events/sec (simulated, N symbols) | ~507 events/s (N=505; Kafka end-offset delta 31,310 over 61.72 s; producer logs +505/s) |
-| End-to-end latency (event -> warehouse) | 135.641074 s (2 m 15.6 s), probe `LATENCYPROBEUSDT`, `event_time` 15:06:44.368926 UTC -> `ingested_at` 15:09:00.01 UTC |
-| Raw data in lake after 24h | ~9.05 MiB **projection** (5,093,976 B / 4.858 MiB observed over 12.88 h under `raw/ticks/`; not a measured 24 h figure; includes ~4 min of N=505 load) |
+| End-to-end latency (event -> warehouse) | 135.641074 s (2 m 15.6 s) — by design: 1-min watermark + 30 s trigger (probe `LATENCYPROBEUSDT`, `event_time` 15:06:44.368926 UTC -> `ingested_at` 15:09:00.01 UTC) |
+| Raw data in lake after 24h | ~9.05 MiB **projection** from mostly the 5-symbol load, not 505 (5,093,976 B / 4.858 MiB observed over 12.88 h under `raw/ticks/`; not a measured 24 h figure; the ~4 min N=505 burst is a small part of that window) |
 | 1-minute windows in warehouse | 4,136 (first 02:16:00, last 15:07:00 UTC) |
 | dbt tests passed | 15 (PASS=15, WARN=0, ERROR=0, TOTAL=15) |
 | Unit tests | 12 passed in 0.99s |

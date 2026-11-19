@@ -26,8 +26,9 @@ models:
         tests:
           - not_null
           - relationships:
-              to: ref('dim_symbol')
-              field: symbol_key
+              arguments:
+                to: ref('dim_symbol')
+                field: symbol_key
   - name: mart_hourly_prices
     columns:
       - name: symbol

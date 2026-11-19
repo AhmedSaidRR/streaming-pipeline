@@ -923,3 +923,494 @@ WARNING: Running pip as the 'root' user can result in broken permissions and con
 - [x] dbt test: 15 passed
 - [x] Unit tests: 12 passed
 - [x] No commit made; only this file and the README Results table edited
+
+---
+
+## Phase 4 — dbt quality
+
+All commands below were run on 2026-11-19 on this machine (Docker Desktop 29.8.0). PowerShell
+unless a `sh -c` is shown. ANSI colour codes and trailing spaces were stripped from dbt output
+for readability; the text is otherwise verbatim. No command printed a credential, so there is nothing to mask with
+`***`. Only `dbt/`, `README.md` and this file were edited; no Spark, producer, Docker or pytest
+file was changed. Existing evidence above was left untouched.
+
+### 4.0 Baseline
+
+```
+> git status --short; git log -3 --oneline
+8c50bad docs: phase 3 measured results (throughput, latency, windows, lake, tests)
+93b141a feat(dlq): prove dead-letter reasons, replay repair and sink-failure recovery
+93a555e wip: phase 2 dead-letter and sink-failure handling (coded, partly verified)
+```
+(`git status --short` produced no output — clean working tree.)
+
+```
+> docker compose ps
+NAME                                     IMAGE                                                                                         COMMAND                  SERVICE             CREATED             STATUS                       PORTS
+streaming-pipeline-airflow-db-1          postgres:16.16                                                                                "docker-entrypoint.s…"   airflow-db          13 hours ago        Up 2 hours (healthy)         5432/tcp
+streaming-pipeline-airflow-scheduler-1   streaming-pipeline-airflow:2.10.5-dbt1.11                                                     "/usr/bin/dumb-init …"   airflow-scheduler   13 hours ago        Up 2 hours (healthy)         8080/tcp
+streaming-pipeline-airflow-webserver-1   streaming-pipeline-airflow:2.10.5-dbt1.11                                                     "/usr/bin/dumb-init …"   airflow-webserver   13 hours ago        Up 2 hours (healthy)         0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+streaming-pipeline-dashboard-1           streaming-pipeline-app:1.0.0                                                                  "streamlit run dashb…"   dashboard            About an hour ago   Up About an hour (healthy)   0.0.0.0:8501->8501/tcp, [::]:8501->8501/tcp
+streaming-pipeline-kafka-1               apache/kafka:3.8.0                                                                            "/__cacert_entrypoin…"   kafka               13 hours ago        Up 2 hours (healthy)         9092/tcp
+streaming-pipeline-lake-1                chrislusf/seaweedfs@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15   "/entrypoint.sh serv…"   lake                13 hours ago        Up 2 hours (healthy)         0.0.0.0:8333->8333/tcp, [::]:8333->8333/tcp, 0.0.0.0:8888->8888/tcp, [::]:8888->8888/tcp, 0.0.0.0:9333->9333/tcp, [::]:9333->9333/tcp
+streaming-pipeline-producer-1            streaming-pipeline-app:1.0.0                                                                  "python -m producer.…"   producer            17 minutes ago      Up 17 minutes
+streaming-pipeline-spark-1               streaming-pipeline-spark:3.5.3                                                                "/opt/entrypoint.sh …"   spark               13 hours ago        Up About an hour
+streaming-pipeline-warehouse-1           postgres:16.16                                                                                "docker-entrypoint.s…"   warehouse           13 hours ago        Up About an hour (healthy)   0.0.0.0:5433->5432/tcp, [::]:5433->5432/tcp
+```
+
+### 4.1 BEFORE — the deprecation warning
+
+A normal `dbt test` printed no warning because dbt's partial-parse cache had already parsed the
+files. Forcing a full parse surfaces it:
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler /home/airflow/dbt_venv/bin/dbt test --profiles-dir /opt/airflow/dbt 2>&1 | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }
+15:28:43  Running with dbt=1.11.0
+15:28:43  Registered adapter: postgres=1.11.0
+15:28:44  Found 6 models, 1 snapshot, 15 data tests, 1 seed, 1 source, 479 macros
+...
+15:28:45  Done. PASS=15 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=15
+```
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler sh -c "/home/airflow/dbt_venv/bin/dbt --no-partial-parse test --profiles-dir /opt/airflow/dbt > /tmp/dbt_before.txt 2>&1; grep -inE 'deprecat|warn' /tmp/dbt_before.txt | head -40; echo '--- FAILED_SUMMARY ---'; tail -12 /tmp/dbt_before.txt"
+3:15:29:29  [WARNING][MissingArgumentsPropertyInGenericTestDeprecation]: Deprecated
+47:15:29:31  Done. PASS=15 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=15
+48:15:29:31  [WARNING][DeprecationsSummary]: Deprecated functionality
+49:Summary of encountered deprecations:
+50:- MissingArgumentsPropertyInGenericTestDeprecation: 1 occurrence
+51:To see all deprecation instances instead of just the first occurrence of each,
+52:run command again with the `--show-all-deprecations` flag. You may also need to
+53:run with `--no-partial-parse` as some deprecations are only encountered during
+```
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler sh -c "/home/airflow/dbt_venv/bin/dbt --no-partial-parse --show-all-deprecations test --profiles-dir /opt/airflow/dbt 2>&1 | sed -E 's/\x1B\[[0-9;]*[mK]//g' | head -22"
+15:29:41  Running with dbt=1.11.0
+15:29:41  Registered adapter: postgres=1.11.0
+15:29:43  [WARNING][MissingArgumentsPropertyInGenericTestDeprecation]: Deprecated
+functionality
+Found top-level arguments to test `relationships` defined on 'fct_price_1m' in
+package 'streaming_pipeline' (models/schema.yml). Arguments to generic tests
+should be nested under the `arguments` property.
+15:29:44  Found 6 models, 1 snapshot, 15 data tests, 1 seed, 1 source, 479 macros
+15:29:44
+15:29:44  Concurrency: 2 threads (target='dev')
+15:29:44
+15:29:44  1 of 15 START test assert_min_le_avg_le_max .................................... [RUN]
+15:29:44  2 of 15 START test assert_prices_positive ...................................... [RUN]
+15:29:44  2 of 15 PASS assert_prices_positive ............................................ [PASS in 0.09s]
+15:29:44  1 of 15 PASS assert_min_le_avg_le_max .......................................... [PASS in 0.09s]
+15:29:44  3 of 15 START test assert_stg_unique_symbol_window ............................. [RUN]
+15:29:44  4 of 15 START test not_null_dim_symbol_asset_class ............................. [RUN]
+15:29:44  4 of 15 PASS not_null_dim_symbol_asset_class ................................... [PASS in 0.12s]
+15:29:44  5 of 15 START test not_null_dim_symbol_symbol .................................. [RUN]
+15:29:44  3 of 15 PASS assert_stg_unique_symbol_window ................................... [PASS in 0.15s]
+15:29:44  6 of 15 START test not_null_dim_symbol_symbol_key .............................. [RUN]
+15:29:44  5 of 15 PASS not_null_dim_symbol_symbol ........................................ [PASS in 0.05s]
+...
+```
+
+### 4.2 Change made and AFTER — no deprecation warning
+
+`dbt/models/schema.yml` now nests the `relationships` arguments:
+
+```yaml
+        - not_null
+        - relationships:
+            arguments:
+              to: ref('dim_symbol')
+              field: symbol_key
+```
+
+`sources.yml`, `dbt_project.yml` and `profiles.yml` contain no generic-test arguments, so no
+other yml needed a syntax change.
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler sh -c "/home/airflow/dbt_venv/bin/dbt --no-partial-parse --show-all-deprecations test --profiles-dir /opt/airflow/dbt 2>&1 | sed -E 's/\x1B\[[0-9;]*[mK]//g'"
+15:30:54  Running with dbt=1.11.0
+15:30:55  Registered adapter: postgres=1.11.0
+15:30:57  Found 6 models, 1 snapshot, 15 data tests, 1 seed, 1 source, 479 macros
+15:30:57
+15:30:57  Concurrency: 2 threads (target='dev')
+15:30:57
+15:30:57  1 of 15 START test assert_min_le_avg_le_max .................................... [RUN]
+15:30:57  2 of 15 START test assert_prices_positive ...................................... [RUN]
+15:30:58  2 of 15 PASS assert_prices_positive ............................................ [PASS in 0.09s]
+15:30:58  1 of 15 PASS assert_min_le_avg_le_max .......................................... [PASS in 0.12s]
+15:30:58  3 of 15 START test assert_source_price_windows_unique .......................... [RUN]
+15:30:58  4 of 15 START test not_null_dim_symbol_asset_class ............................. [RUN]
+15:30:58  4 of 15 PASS not_null_dim_symbol_asset_class ................................... [PASS in 0.12s]
+15:30:58  5 of 15 START test not_null_dim_symbol_symbol .................................. [RUN]
+15:30:58  3 of 15 PASS assert_source_price_windows_unique ................................ [PASS in 0.13s]
+15:30:58  6 of 15 START test not_null_dim_symbol_symbol_key .............................. [RUN]
+15:30:58  6 of 15 PASS not_null_dim_symbol_symbol_key .................................... [PASS in 0.05s]
+15:30:58  5 of 15 PASS not_null_dim_symbol_symbol ........................................ [PASS in 0.05s]
+15:30:58  7 of 15 START test not_null_fct_price_1m_symbol_key ............................ [RUN]
+15:30:58  8 of 15 START test not_null_mart_hourly_prices_symbol .......................... [RUN]
+15:30:58  7 of 15 PASS not_null_fct_price_1m_symbol_key .................................. [PASS in 0.05s]
+15:30:58  8 of 15 PASS not_null_mart_hourly_prices_symbol ................................. [PASS in 0.05s]
+15:30:58  9 of 15 START test not_null_mart_symbol_history_valid_from ..................... [RUN]
+15:30:58  10 of 15 START test not_null_stg_price_windows_avg_price ....................... [RUN]
+15:30:58  9 of 15 PASS not_null_mart_symbol_history_valid_from ........................... [PASS in 0.05s]
+15:30:58  11 of 15 START test not_null_stg_price_windows_symbol .......................... [RUN]
+15:30:58  10 of 15 PASS not_null_stg_price_windows_avg_price ............................. [PASS in 0.06s]
+15:30:58  12 of 15 START test not_null_stg_price_windows_window_start .................... [RUN]
+15:30:58  11 of 15 PASS not_null_stg_price_windows_symbol ................................ [PASS in 0.05s]
+15:30:58  13 of 15 START test relationships_fct_price_1m_symbol_key__symbol_key__ref_dim_symbol_  [RUN]
+15:30:58  12 of 15 PASS not_null_stg_price_windows_window_start .......................... [PASS in 0.06s]
+15:30:58  14 of 15 START test unique_dim_symbol_symbol ................................... [RUN]
+15:30:58  13 of 15 PASS relationships_fct_price_1m_symbol_key__symbol_key__ref_dim_symbol_  [PASS in 0.06s]
+15:30:58  15 of 15 START test unique_dim_symbol_symbol_key ............................... [RUN]
+15:30:58  14 of 15 PASS unique_dim_symbol_symbol ......................................... [PASS in 0.06s]
+15:30:58  15 of 15 PASS unique_dim_symbol_symbol_key ..................................... [PASS in 0.05s]
+15:30:58
+15:30:58  Finished running 15 data tests in 0 hours 0 minutes and 0.74 seconds (0.74s).
+15:30:58
+15:30:58  Completed successfully
+15:30:58
+15:30:58  Done. PASS=15 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=15
+```
+
+No `WARNING` / `DeprecationsSummary` line appears. (The `--no-partial-parse` flag was kept in
+this verification run so the comparison is apples-to-apples with 4.1.)
+
+### 4.3 Meaningful uniqueness test — source table, severity warn, scratch-proofed
+
+`dbt/tests/assert_stg_unique_symbol_window.sql` was removed (the staging view dedupes, so it
+could never fail) and replaced by `dbt/tests/assert_source_price_windows_unique.sql`:
+
+```sql
+-- Spark writes raw.price_windows at-least-once: after a restart the same
+-- (symbol, window_start) can legitimately appear twice. stg_price_windows
+-- deduplicates, so testing uniqueness there can never fail -- test the
+-- append-only source instead and report duplicates as a warning.
+--
+-- The relation is a var so the exact same test can be pointed at a scratch
+-- copy for the proof, without inserting into or deleting from real rows.
+{{ config(severity='warn') }}
+
+select
+    upper(symbol) as symbol,
+    window_start,
+    count(*) as duplicate_count
+from {{ var('price_windows_uniqueness_relation', source('raw', 'price_windows')) }}
+group by 1, 2
+having count(*) > 1
+```
+
+The default relation is the real source. Baseline — the real source currently has no duplicates:
+
+```
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "select count(*) as total_rows, count(distinct (upper(symbol), window_start)) as distinct_pairs from raw.price_windows;"
+ total_rows | distinct_pairs
+------------+----------------
+       5236 |           5236
+(1 row)
+```
+
+Scratch table: an empty copy of the real table plus two identical rows. No real row was
+inserted, updated or deleted.
+
+```
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "create table raw.price_windows_dup_probe as select * from raw.price_windows where false;"
+SELECT 0
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "insert into raw.price_windows_dup_probe select * from raw.price_windows order by ingested_at desc limit 1; insert into raw.price_windows_dup_probe select * from raw.price_windows order by ingested_at desc limit 1; select symbol, window_start, count(*) as n from raw.price_windows_dup_probe group by 1,2;"
+INSERT 0 1
+INSERT 0 1
+ symbol  |    window_start     | n
+---------+---------------------+---
+ SOLUSDT | 2026-11-19 15:28:00 | 2
+(1 row)
+```
+
+The same dbt test, pointed at the scratch table with `--vars` (no file edit between runs):
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler /home/airflow/dbt_venv/bin/dbt test --profiles-dir /opt/airflow/dbt --select assert_source_price_windows_unique --vars '{price_windows_uniqueness_relation: raw.price_windows_dup_probe}' 2>&1 | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }; "dbt_exit=$LASTEXITCODE"
+15:31:38  Running with dbt=1.11.0
+15:31:38  Registered adapter: postgres=1.11.0
+15:31:38  Unable to do partial parsing because config vars, config profile, or config target have changed
+15:31:41  Found 6 models, 1 snapshot, 15 data tests, 1 seed, 1 source, 479 macros
+15:31:41
+15:31:41  Concurrency: 2 threads (target='dev')
+15:31:41
+15:31:41  1 of 1 START test assert_source_price_windows_unique ........................... [RUN]
+15:31:41  1 of 1 WARN 1 assert_source_price_windows_unique ............................... [WARN 1 in 0.07s]
+15:31:41
+15:31:41  Finished running 1 test in 0 hours 0 minutes and 0.34 seconds (0.34s).
+15:31:41
+15:31:41  Completed with 1 warning:
+15:31:41
+15:31:41  Warning in test assert_source_price_windows_unique (tests/assert_source_price_windows_unique.sql)
+15:31:41  Got 1 result, configured to warn if != 0
+15:31:41
+15:31:41    compiled code at target/compiled/streaming_pipeline/tests/assert_source_price_windows_unique.sql
+15:31:41
+15:31:41  Done. PASS=0 WARN=1 ERROR=0 SKIP=0 NO-OP=0 TOTAL=1
+dbt_exit=0
+```
+
+The test detects the duplicate (`WARN 1`, one result, `severity: warn`). dbt exits **0** on a
+warning: duplicates are expected with at-least-once writes, so the test is informative rather
+than a pipeline breaker. On the real source (no duplicates) the same test passes — see 4.2 and
+4.4.
+
+```
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "drop table raw.price_windows_dup_probe;"
+DROP TABLE
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "select to_regclass('raw.price_windows_dup_probe') as scratch_table, count(*) as real_rows, count(distinct (upper(symbol), window_start)) as real_distinct_pairs from raw.price_windows;"
+ scratch_table | real_rows | real_distinct_pairs
+---------------+-----------+---------------------
+               |      5246 |                5246
+(1 row)
+```
+
+`scratch_table` is NULL (dropped). `real_rows` grew 5236 -> 5246 because the live Spark stream
+keeps appending windows; `real_distinct_pairs` equals `real_rows`, so no duplicate was left
+behind.
+
+### 4.4 Full dbt pipeline inside airflow-scheduler
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler /home/airflow/dbt_venv/bin/dbt seed --profiles-dir /opt/airflow/dbt 2>&1 | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }
+15:32:30  Running with dbt=1.11.0
+15:32:31  Registered adapter: postgres=1.11.0
+15:32:31  Unable to do partial parsing because config vars, config profile, or config target have changed
+15:32:34  Found 6 models, 1 snapshot, 15 data tests, 1 seed, 1 source, 479 macros
+15:32:34
+15:32:34  Concurrency: 2 threads (target='dev')
+15:32:34
+15:32:34  1 of 1 START seed file reference.symbol_metadata ............................... [RUN]
+15:32:34  1 of 1 OK loaded seed file reference.symbol_metadata ........................... [INSERT 5 in 0.18s]
+15:32:34
+15:32:34  Finished running 1 seed in 0 hours 0 minutes and 0.37 seconds (0.37s).
+15:32:34
+15:32:34  Completed successfully
+15:32:34
+15:32:34  Done. PASS=1 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=1
+```
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler /home/airflow/dbt_venv/bin/dbt snapshot --profiles-dir /opt/airflow/dbt 2>&1 | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }
+15:32:45  Running with dbt=1.11.0
+15:32:45  Registered adapter: postgres=1.11.0
+15:32:46  Found 6 models, 1 snapshot, 15 data tests, 1 seed, 1 source, 479 macros
+15:32:46
+15:32:46  Concurrency: 2 threads (target='dev')
+15:32:46
+15:32:46  1 of 1 START snapshot snapshots.symbol_metadata_snapshot ....................... [RUN]
+15:32:46  1 of 1 OK snapshotted snapshots.symbol_metadata_snapshot ....................... [INSERT 0 0 in 0.27s]
+15:32:46
+15:32:46  Finished running 1 snapshot in 0 hours 0 minutes and 0.44 seconds (0.44s).
+15:32:46
+15:32:46  Completed successfully
+15:32:46
+15:32:46  Done. PASS=1 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=1
+```
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler /home/airflow/dbt_venv/bin/dbt run --profiles-dir /opt/airflow/dbt 2>&1 | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }
+15:32:57  Running with dbt=1.11.0
+15:32:57  Registered adapter: postgres=1.11.0
+15:32:58  Found 6 models, 1 snapshot, 15 data tests, 1 seed, 1 source, 479 macros
+15:32:58
+15:32:58  Concurrency: 2 threads (target='dev')
+15:32:58
+15:32:58  1 of 6 START sql table model marts.mart_symbol_history ......................... [RUN]
+15:32:58  2 of 6 START sql view model staging.stg_price_windows .......................... [RUN]
+15:32:58  2 of 6 OK created sql view model staging.stg_price_windows ..................... [CREATE VIEW in 0.19s]
+15:32:58  1 of 6 OK created sql table model marts.mart_symbol_history .................... [SELECT 5 in 0.20s]
+15:32:58  3 of 6 START sql table model marts.dim_symbol .................................. [RUN]
+15:32:58  3 of 6 OK created sql table model marts.dim_symbol ............................. [SELECT 506 in 0.08s]
+15:32:58  4 of 6 START sql table model marts.fct_price_1m ................................ [RUN]
+15:32:59  4 of 6 OK created sql table model marts.fct_price_1m ........................... [SELECT 5246 in 0.12s]
+15:32:59  5 of 6 START sql table model marts.mart_hourly_prices .......................... [RUN]
+15:32:59  6 of 6 START sql table model marts.mart_volatility_alerts ...................... [RUN]
+15:32:59  6 of 6 OK created sql table model marts.mart_volatility_alerts ................. [SELECT 4454 in 0.16s]
+15:32:59  5 of 6 OK created sql table model marts.mart_hourly_prices ..................... [SELECT 521 in 0.16s]
+15:32:59
+15:32:59  Finished running 5 table models, 1 view model in 0 hours 0 minutes and 0.79 seconds (0.79s).
+15:32:59
+15:32:59  Completed successfully
+15:32:59
+15:32:59  Done. PASS=6 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=6
+```
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler /home/airflow/dbt_venv/bin/dbt test --profiles-dir /opt/airflow/dbt 2>&1 | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }; "dbt_exit=$LASTEXITCODE"
+15:33:17  Running with dbt=1.11.0
+15:33:18  Registered adapter: postgres=1.11.0
+15:33:19  Found 6 models, 1 snapshot, 15 data tests, 1 seed, 1 source, 479 macros
+15:33:19
+15:33:19  Concurrency: 2 threads (target='dev')
+15:33:19
+15:33:19  1 of 15 START test assert_min_le_avg_le_max .................................... [RUN]
+15:33:19  2 of 15 START test assert_prices_positive ...................................... [RUN]
+15:33:19  2 of 15 PASS assert_prices_positive ............................................ [PASS in 0.11s]
+15:33:19  1 of 15 PASS assert_min_le_avg_le_max .......................................... [PASS in 0.12s]
+15:33:19  3 of 15 START test assert_source_price_windows_unique .......................... [RUN]
+15:33:19  4 of 15 START test not_null_dim_symbol_asset_class ............................. [RUN]
+15:33:19  4 of 15 PASS not_null_dim_symbol_asset_class ................................... [PASS in 0.06s]
+15:33:19  5 of 15 START test not_null_dim_symbol_symbol .................................. [RUN]
+15:33:19  3 of 15 PASS assert_source_price_windows_unique ................................ [PASS in 0.08s]
+15:33:19  6 of 15 START test not_null_dim_symbol_symbol_key .............................. [RUN]
+15:33:19  6 of 15 PASS not_null_dim_symbol_symbol_key .................................... [PASS in 0.05s]
+15:33:19  5 of 15 PASS not_null_dim_symbol_symbol ........................................ [PASS in 0.06s]
+15:33:19  7 of 15 START test not_null_fct_price_1m_symbol_key ............................ [RUN]
+15:33:19  8 of 15 START test not_null_mart_hourly_prices_symbol .......................... [RUN]
+15:33:19  8 of 15 PASS not_null_mart_hourly_prices_symbol ................................. [PASS in 0.08s]
+15:33:19  7 of 15 PASS not_null_fct_price_1m_symbol_key .................................. [PASS in 0.09s]
+15:33:19  9 of 15 START test not_null_mart_symbol_history_valid_from ..................... [RUN]
+15:33:19  10 of 15 START test not_null_stg_price_windows_avg_price ....................... [RUN]
+15:33:19  9 of 15 PASS not_null_mart_symbol_history_valid_from ........................... [PASS in 0.08s]
+15:33:19  11 of 15 START test not_null_stg_price_windows_symbol .......................... [RUN]
+15:33:19  10 of 15 PASS not_null_stg_price_windows_avg_price ............................. [PASS in 0.10s]
+15:33:19  12 of 15 START test not_null_stg_price_windows_window_start .................... [RUN]
+15:33:19  11 of 15 PASS not_null_stg_price_windows_symbol ................................ [PASS in 0.06s]
+15:33:19  13 of 15 START test relationships_fct_price_1m_symbol_key__symbol_key__ref_dim_symbol_  [RUN]
+15:33:19  12 of 15 PASS not_null_stg_price_windows_window_start .......................... [PASS in 0.06s]
+15:33:19  14 of 15 START test unique_dim_symbol_symbol ................................... [RUN]
+15:33:19  13 of 15 PASS relationships_fct_price_1m_symbol_key__symbol_key__ref_dim_symbol_  [PASS in 0.08s]
+15:33:19  14 of 15 PASS unique_dim_symbol_symbol ......................................... [PASS in 0.06s]
+15:33:19  15 of 15 START test unique_dim_symbol_symbol_key ............................... [RUN]
+15:33:20  15 of 15 PASS unique_dim_symbol_symbol_key ..................................... [PASS in 0.11s]
+15:33:20
+15:33:20  Finished running 15 data tests in 0 hours 0 minutes and 0.95 seconds (0.95s).
+15:33:20
+15:33:20  Completed successfully
+15:33:20
+15:33:20  Done. PASS=15 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=15
+dbt_exit=0
+```
+
+All four commands succeeded: seed 1/1, snapshot 1/1, run 6/6, test 15/15 PASS (the new source
+test is PASS because the live source has no duplicates right now). WARN=0 here; the WARN path was
+proved separately in 4.3 with the scratch table.
+
+### 4.5 Unit tests (Phase 2 command, unchanged)
+
+```
+> docker compose run --rm --no-deps -v "${PWD}/tests:/app/tests" -v "${PWD}/dbt:/app/dbt" producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q" 2>&1 | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }; "pytest_exit=$LASTEXITCODE"
+ Container streaming-pipeline-producer-run-9c888934e3f7 Creating
+ Container streaming-pipeline-producer-run-9c888934e3f7 Created
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+System.Management.Automation.RemoteException
+[notice] A new release of pip is available: 24.0 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+............                                                             [100%]
+12 passed in 0.77s
+pytest_exit=0
+```
+
+`System.Management.Automation.RemoteException` is PowerShell's wrapper for pip's stderr notice,
+not a test error; `12 passed` and exit 0 are the result. No test was weakened or deleted.
+
+### 4.6 Evidence behind the README fixes
+
+Spark jars are in the image, and the current Spark log contains no resolution/download lines:
+
+```
+> docker compose exec -T spark sh -c "ls -1 /opt/spark/jars | grep -E 'spark-sql-kafka|kafka-clients|hadoop-aws|aws-java-sdk-bundle|postgresql'"
+aws-java-sdk-bundle-1.12.262.jar
+hadoop-aws-3.3.4.jar
+kafka-clients-3.4.1.jar
+postgresql-42.7.3.jar
+spark-sql-kafka-0-10_2.12-3.5.3.jar
+> $hits = docker compose logs spark 2>&1 | Select-String -Pattern "Ivy|downloading|Resolving dependencies|--packages"; "ivy_or_download_log_lines=$($hits.Count)"; docker compose logs spark 2>&1 | Select-Object -First 4
+ivy_or_download_log_lines=0
+spark-1  | 26/11/19 02:16:43 INFO SparkContext: Running Spark version 3.5.3
+spark-1  | 26/11/19 02:16:43 INFO SparkContext: OS info Linux, 6.18.33.2-microsoft-standard-WSL2, amd64
+spark-1  | 26/11/19 02:16:43 INFO SparkContext: Java version 17.0.12
+spark-1  | 26/11/19 02:16:43 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+```
+(That command exits 1 in PowerShell because `docker compose logs` writes to stderr; the printed
+output is complete.)
+
+The "~30 s cold start" figure comes from the measured full-stack boots in **1.2** earlier in
+this session, re-quoted here (not re-run in Phase 4, to avoid restarting the live stream):
+
+| Boot | Command | Result | Time |
+|---|---|---|---|
+| 1 | `docker compose down` + `up -d --build` | 9 services up | 33 s |
+| 2 | `.env` moved out of the repo, `down` + `up -d` | 9 services up, `compose config` still OK | 36 s |
+| 3 | `down` + `up -d` | 9 services up | 33 s |
+| 4 | `down -v` (all volumes wiped) + `up -d` | 9 services up, DAG unpaused | 26 s |
+
+N=505 = 5 base symbols + 500 extra, and the throughput measurement is from **3.2** earlier in
+this session (re-quoted, not re-run, to avoid reintroducing the 505-symbol load):
+
+```
+> Get-Content docker-compose.yml | Select-Object -Skip 107 -First 6; docker compose exec -T producer printenv SYMBOLS SIM_EXTRA_SYMBOLS
+      <<: *app-env
+      SOURCE: ${SOURCE:-simulated}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT}
+      POLL_INTERVAL_SEC: ${POLL_INTERVAL_SEC:-1}
+      SIM_EXTRA_SYMBOLS: ${SIM_EXTRA_SYMBOLS:-0}
+      PYTHONUNBUFFERED: "1"
+BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT
+0
+```
+
+```
+> $env:SIM_EXTRA_SYMBOLS='500'; docker compose up -d --force-recreate --no-deps producer
+  Container streaming-pipeline-producer-1 Recreate
+  Container streaming-pipeline-producer-1 Recreated
+  Container streaming-pipeline-producer-1 Starting
+  Container streaming-pipeline-producer-1 Started
+SIM_EXTRA_SYMBOLS=500
+> docker compose logs --tail 8 producer
+producer-1  | 2026-11-19 15:01:50,506 INFO producer - sent=2525 rejected=0
+producer-1  | 2026-11-19 15:01:51,514 INFO producer - sent=3030 rejected=0
+producer-1  | 2026-11-19 15:01:52,502 INFO producer - sent=3535 rejected=0
+producer-1  | 2026-11-19 15:01:53,502 INFO producer - sent=4040 rejected=0
+producer-1  | 2026-11-19 15:01:54,512 INFO producer - sent=4545 rejected=0
+producer-1  | 2026-11-19 15:01:55,513 INFO producer - sent=5050 rejected=0
+producer-1  | 2026-11-19 15:01:56,501 INFO producer - sent=5555 rejected=0
+producer-1  | 2026-11-19 15:01:57,502 INFO producer - sent=6060 rejected=0
+> (60 s Kafka end-offset measurement from 3.2)
+t0=17:04:57.567 kafka_end=132211 producer_sent=96960
+t1=17:05:59.288 kafka_end=163521 producer_sent=127765
+kafka_delta=31310 producer_delta=30805 elapsed=61.7208793
+kafka_events_per_sec=507.28 producer_events_per_sec=499.1
+```
+
+README lines now read: ~30 s cold start / jars baked in; `SIM_EXTRA_SYMBOLS=500` -> ~505
+events/sec (5 + 500); latency "by design: 1-min watermark + 30 s trigger"; lake "~9.05 MiB
+**projection** from mostly the 5-symbol load, not 505". The design-decision bullet about the
+staging uniqueness test was updated to describe the new source-level warn test.
+
+### 4.7 Decisions, deviations and honest notes
+
+- The deprecation warning is only emitted on a full parse. Normal runs after the fix were clean
+  both with and without `--no-partial-parse`; 4.2 uses the stricter form.
+- "Existing tests" was interpreted as the 12 pytest unit tests: those were left alone and still
+  pass. The dbt singular test that could never fail was explicitly in scope for replacement;
+  it was removed and a new one added, keeping the total at 15 data tests.
+- A `var()` relation was used so the very same test SQL can be proven against a scratch table
+  without changing the default (the real source) or touching real rows. This is a test-only
+  parameter, not a weakening: no filter, threshold or tolerance was added.
+- `severity: warn` is deliberate: at-least-once writes can legitimately duplicate, so a
+  duplicate produces `WARN` (dbt exit 0) rather than `ERROR`. The live source has 0 duplicates
+  now (4.0 proof: 5236 rows / 5236 pairs; later 5246 / 5246), hence the normal run is all-PASS.
+- The cold-start and throughput figures in 4.6 are re-quoted from Phase 1 and Phase 3, where
+  their commands and real outputs were already pasted in this file; they were not re-measured in
+  Phase 4 so the live 505-symbol load was not reintroduced and Spark was not restarted.
+- The lake-size row remains a projection: it is derived from a mostly 5-symbol window, and the
+  README now says so explicitly. No real warehouse or lake row was deleted.
+- Final post-commit `git log --oneline -3`, `git status --short` and `docker compose ps` were run
+  after the commit and are reported in the chat response; the commit hash cannot be pasted into
+  a file that is itself part of that commit. Pre-commit state is in 4.0.
+
+### 4.8 Phase 4 status (before commit)
+
+- [x] `relationships` arguments nested under `arguments:`; `MissingArgumentsPropertyInGenericTestDeprecation`
+      gone on a forced full parse (1 occurrence before, 0 after)
+- [x] Tautological staging uniqueness test replaced with a source-level `(symbol, window_start)`
+      duplicate test at `severity: warn`; proven to emit `WARN 1` on a scratch duplicate, scratch
+      object dropped afterwards
+- [x] `dbt seed`, `dbt snapshot`, `dbt run`, `dbt test` all succeeded in `airflow-scheduler`
+      (1/1, 1/1, 6/6, 15/15 PASS)
+- [x] 12 unit tests pass with the Phase 2 Docker command
+- [x] Two stale README lines and the latency/lake Results rows corrected
+- [x] No step failed in Phase 4
