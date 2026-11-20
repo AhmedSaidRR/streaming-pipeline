@@ -58,10 +58,30 @@ docker compose up -d --build
 2. In Airflow, unpause `streaming_analytics`. It runs every 5 minutes: freshness check -> `dbt seed` -> `dbt snapshot` -> `dbt run` -> `dbt test`.
 3. Open the dashboard.
 
-If Binance is blocked in your region, set `SOURCE=simulated` in `.env` and run `docker compose up -d --force-recreate producer`.
+`SOURCE=simulated` is the default (offline and reproducible, see `.env.example`). Using live
+prices is **optional**: set `SOURCE=binance` in `.env` (the public API is geo-blocked in some
+regions) and run `docker compose up -d --force-recreate producer`. If Binance is blocked, keep
+or restore `SOURCE=simulated`.
 
 ### Throughput test
 Set `SOURCE=simulated` and `SIM_EXTRA_SYMBOLS=500` to generate ~505 events/sec (5 base symbols + 500 extra), then record the numbers in the Results table.
+
+## Verify everything
+
+After `docker compose up -d` and a few minutes of data flow, one command checks the whole stack
+— all services up/healthy, Kafka has messages, lake has `raw/ticks` objects, `raw.price_windows`
+has fresh rows, `dbt test` passes, the `streaming_analytics` DAG exists and is unpaused, and the
+dashboard answers HTTP 200 on port 8501. It prints a PASS/FAIL table and exits 1 if anything
+fails; it does not modify data.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
+```
+
+CI runs on every push and pull request (`.github/workflows/ci.yml`): ruff, the 12 pytest unit
+tests, `dbt parse`, `docker compose config -q` and `docker compose build`. The real outputs of
+those same steps run locally are in `VERIFICATION.md`. No status badge is included yet because
+the repository has not been pushed to GitHub.
 
 ## SCD Type 2 demo (slowly changing dimension)
 

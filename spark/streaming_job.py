@@ -154,7 +154,7 @@ def main():
              .option("checkpointLocation", f"{CKPT}/windows")
              .trigger(processingTime=TRIGGER).start())
 
-    log.info("streaming queries started: %s", [q.name for q in spark.streams.active])
+    log.info("streaming queries started: %s", [q.name for q in (q_raw, q_dead, q_win)])
     spark.streams.awaitAnyTermination()
 
 

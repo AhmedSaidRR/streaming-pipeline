@@ -1,7 +1,13 @@
 name: CI
 on: [push, pull_request]
+
+# Every job pins its tool versions (requirements files / explicit pip pins) and uses
+# Python 3.11: the pinned dependencies do not build on the host's Python 3.14.
+# The old `python -m py_compile ...` step is replaced by the five real checks below.
+
 jobs:
-  checks:
+  ruff:
+    name: ruff check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -10,6 +16,50 @@ jobs:
           python-version: "3.11"
       - run: pip install -r requirements-dev.txt
       - run: ruff check .
-      - run: python -m py_compile spark/streaming_job.py dags/analytics_pipeline.py dashboard/app.py
-      - run: pytest -q
-      - run: cp .env.example .env && docker compose config -q
+
+  pytest:
+    name: pytest (12 unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt -r requirements.txt
+      - run: python -m pytest -q
+
+  dbt-parse:
+    name: dbt parse
+    runs-on: ubuntu-latest
+    # dbt/profiles.yml reads all connection values from env vars. These are dummy
+    # values: `dbt parse` only compiles the project, it does not open a database
+    # connection (proved locally with an unreachable WH_HOST), so no postgres
+    # service container is required.
+    env:
+      WH_HOST: localhost
+      WH_PORT: "5432"
+      WH_USER: postgres
+      WH_PASSWORD: postgres
+      WH_DB: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install dbt-core==1.11.0 dbt-postgres==1.11.0
+      - run: dbt parse --project-dir dbt --profiles-dir dbt
+
+  compose-config:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config -q
+
+  compose-build:
+    name: docker compose build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build

@@ -1414,3 +1414,457 @@ staging uniqueness test was updated to describe the new source-level warn test.
 - [x] 12 unit tests pass with the Phase 2 Docker command
 - [x] Two stale README lines and the latency/lake Results rows corrected
 - [x] No step failed in Phase 4
+
+---
+
+## Phase 5 — CI and one-command verification
+
+All commands below were run on 2026-11-20 in this single session (PowerShell on Windows 11,
+Docker Desktop 29.8.0). ANSI colour codes were stripped from dbt output; the text is otherwise
+verbatim. No command printed a credential, so there is nothing to mask with `***`. Existing
+evidence above was left untouched. Only `.github/workflows/ci.yml`, `spark/streaming_job.py`
+(one-line lint fix, see 5.5), `scripts/verify.ps1`, `README.md` and this file were edited.
+
+### 5.0 Baseline, stack up, container state
+
+```
+> git status --short
+(no output - clean working tree)
+
+> git log -3 --oneline
+c9595f3 feat(dbt): phase 4 test cleanup and README fixes
+8c50bad docs: phase 3 measured results (throughput, latency, windows, lake, tests)
+93b141a feat(dlq): prove dead-letter reasons, replay repair and sink-failure recovery
+
+> docker compose ps
+NAME                         IMAGE                            COMMAND                  SERVICE   CREATED        STATUS         PORTS
+streaming-pipeline-spark-1   streaming-pipeline-spark:3.5.3   "/opt/entrypoint.sh …"   spark     36 hours ago   Up 9 minutes
+```
+
+`docker compose up -d` (exit code 1 in PowerShell is the known stderr quirk; container state is
+the source of truth — this time it actually returned 0):
+
+```
+> docker compose up -d
+ Container streaming-pipeline-spark-1 Running
+ Container streaming-pipeline-airflow-db-1 Starting
+ Container streaming-pipeline-warehouse-1 Starting
+ Container streaming-pipeline-lake-1 Starting
+ Container streaming-pipeline-kafka-1 Starting
+ Container streaming-pipeline-airflow-db-1 Started
+ Container streaming-pipeline-warehouse-1 Started
+ Container streaming-pipeline-warehouse-1 Waiting
+ Container streaming-pipeline-airflow-db-1 Waiting
+ Container streaming-pipeline-warehouse-1 Waiting
+ Container streaming-pipeline-lake-1 Started
+ Container streaming-pipeline-lake-1 Waiting
+ Container streaming-pipeline-kafka-1 Started
+ Container streaming-pipeline-kafka-1 Waiting
+ Container streaming-pipeline-airflow-db-1 Healthy
+ Container streaming-pipeline-warehouse-1 Healthy
+ Container streaming-pipeline-warehouse-1 Healthy
+ Container streaming-pipeline-dashboard-1 Starting
+ Container streaming-pipeline-airflow-init-1 Starting
+ Container streaming-pipeline-dashboard-1 Started
+ Container streaming-pipeline-airflow-init-1 Started
+ Container streaming-pipeline-airflow-init-1 Waiting
+ Container streaming-pipeline-airflow-init-1 Waiting
+ Container streaming-pipeline-kafka-1 Healthy
+ Container streaming-pipeline-producer-1 Starting
+ Container streaming-pipeline-producer-1 Started
+ Container streaming-pipeline-airflow-init-1 Exited
+ Container streaming-pipeline-airflow-scheduler-1 Starting
+ Container streaming-pipeline-airflow-init-1 Exited
+ Container streaming-pipeline-airflow-webserver-1 Starting
+ Container streaming-pipeline-airflow-scheduler-1 Started
+ Container streaming-pipeline-airflow-webserver-1 Started
+ Container streaming-pipeline-lake-1 Healthy
+ Container streaming-pipeline-lake-init-1 Starting
+ Container streaming-pipeline-lake-init-1 Started
+ Container streaming-pipeline-kafka-1 Waiting
+ Container streaming-pipeline-warehouse-1 Waiting
+ Container streaming-pipeline-lake-init-1 Waiting
+ Container streaming-pipeline-kafka-1 Healthy
+ Container streaming-pipeline-warehouse-1 Healthy
+ Container streaming-pipeline-lake-init-1 Exited
+up_exit=0
+```
+
+Poll until all nine long-running services are Up (producer/spark have no healthcheck) — the
+first poll already passed, well inside the 3-minute budget:
+
+```
+> (poll loop: docker compose ps --format "{{.Service}}|{{.Status}}", 10 s interval, 180 s deadline)
+poll at 16:36:35: bad=0
+ALL_UP_HEALTHY=True
+
+> docker compose ps --format "table {{.Service}}\t{{.Status}}"
+SERVICE             STATUS
+airflow-db          Up About a minute (healthy)
+airflow-scheduler   Up 46 seconds (healthy)
+airflow-webserver   Up 46 seconds (healthy)
+dashboard           Up About a minute (healthy)
+kafka               Up About a minute (healthy)
+lake                Up About a minute (healthy)
+producer            Up 57 seconds
+spark               Up 11 minutes
+warehouse           Up About a minute (healthy)
+```
+
+### 5.1 Workflow rewrite
+
+The old `python -m py_compile ...` step is gone. Final `.github/workflows/ci.yml` (full file):
+
+```yaml
+name: CI
+on: [push, pull_request]
+
+# Every job pins its tool versions (requirements files / explicit pip pins) and uses
+# Python 3.11: the pinned dependencies do not build on the host's Python 3.14.
+# The old `python -m py_compile ...` step is replaced by the five real checks below.
+
+jobs:
+  ruff:
+    name: ruff check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+
+  pytest:
+    name: pytest (12 unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt -r requirements.txt
+      - run: python -m pytest -q
+
+  dbt-parse:
+    name: dbt parse
+    runs-on: ubuntu-latest
+    # dbt/profiles.yml reads all connection values from env vars. These are dummy
+    # values: `dbt parse` only compiles the project, it does not open a database
+    # connection (proved locally with an unreachable WH_HOST), so no postgres
+    # service container is required.
+    env:
+      WH_HOST: localhost
+      WH_PORT: "5432"
+      WH_USER: postgres
+      WH_PASSWORD: postgres
+      WH_DB: postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install dbt-core==1.11.0 dbt-postgres==1.11.0
+      - run: dbt parse --project-dir dbt --profiles-dir dbt
+
+  compose-config:
+    name: docker compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config -q
+
+  compose-build:
+    name: docker compose build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build
+```
+
+Proof that `dbt parse` needs no live database (dummy/unreachable host, exit 0); this is why the
+job uses env-var dummy values and no postgres service container:
+
+```
+> docker compose exec -T -w /opt/airflow/dbt -e WH_HOST=nonexistent-host airflow-scheduler \
+    /home/airflow/dbt_venv/bin/dbt parse --profiles-dir /opt/airflow/dbt
+14:37:50  Running with dbt=1.11.0
+14:37:50  Registered adapter: postgres=1.11.0
+14:37:51  Unable to do partial parsing because profile has changed
+14:37:53  Performance info: /opt/airflow/dbt/target/perf_info.json
+parse_exit=0
+```
+
+YAML validity and job/step inventory (a first quoting attempt failed in the shell only and is
+not evidence about the file; this is the successful retry):
+
+```
+> docker run --rm -v "${PWD}:/work" -v "<temp>\phase5_yamlcheck.py:/check.py:ro" -w /work \
+    python:3.11-slim sh -c "pip install -q pyyaml==6.0.2 && python /check.py"
+jobs=compose-build,compose-config,dbt-parse,pytest,ruff
+steps=actions/checkout@v4,actions/setup-python@v5,cp .env.example .env,dbt parse --project-dir dbt --profiles-dir dbt,docker compose build,docker compose config -q,pip install -r requirements-dev.txt,pip install -r requirements-dev.txt -r requirements.txt,pip install dbt-core==1.11.0 dbt-postgres==1.11.0,python -m pytest -q,ruff check .
+yaml_exit=0
+```
+
+### 5.2 The same steps run locally
+
+Host Python is 3.14 and the pins do not build there, so Python steps run in Python 3.11
+containers. Every command below is the local equivalent of a CI job step.
+
+#### 5.2.1 ruff — real failure found, fixed, re-run
+
+First run (the new CI step exposed three genuine `F841` unused-variable errors in the Spark
+job; no lint rule was changed):
+
+```
+> docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer \
+    sh -c "pip install -q ruff==0.6.4 && ruff check ."
+spark/streaming_job.py:132:5: F841 Local variable `q_raw` is assigned to but never used
+    |
+130 |             .withColumn("rejected_date", F.to_date("rejected_at")))
+131 |
+132 |     q_raw = (ticks.withColumn("event_date", F.to_date("event_time"))
+    |             ^^^^^ F841
+...
+spark/streaming_job.py:139:5: F841 Local variable `q_dead` is assigned to but never used
+spark/streaming_job.py:152:5: F841 Local variable `q_win` is assigned to but never used
+Found 3 errors.
+No fixes available (3 hidden fixes can be enabled with the `--unsafe-fixes` option).
+ruff_exit=1
+```
+
+Fix (one line, see 5.5): the three query handles already existed, so the log line now uses them
+instead of `spark.streams.active`. Re-run:
+
+```
+> docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer \
+    sh -c "pip install -q ruff==0.6.4 && ruff check ."
+All checks passed!
+ruff_exit=0
+```
+
+#### 5.2.2 pytest — 12 unit tests
+
+```
+> docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer \
+    sh -c "pip install -q -r requirements-dev.txt -r requirements.txt && python -m pytest -q"
+............                                                             [100%]
+12 passed in 1.44s
+pytest_exit=0
+```
+
+(`System.Management.Automation.RemoteException` / pip root warnings on stderr are PowerShell
+wrappers, not test errors; `12 passed` and exit 0 are the result.)
+
+#### 5.2.3 dbt parse — CI command bug found, fixed, re-run
+
+First attempt used `--profiles-dir dbt` only. It failed because the project root was the shell's
+cwd, not `dbt/`:
+
+```
+> docker run --rm -v "${PWD}:/work" -w /work -e WH_HOST=localhost -e WH_PORT=5432 \
+    -e WH_USER=postgres -e WH_PASSWORD=postgres -e WH_DB=postgres python:3.11-slim \
+    sh -c "pip install -q dbt-core==1.11.0 dbt-postgres==1.11.0 && dbt parse --profiles-dir dbt"
+14:42:27  Running with dbt=1.11.0
+14:42:27  Encountered an error:
+Runtime Error
+  No dbt_project.yml found at expected path /work/dbt_project.yml
+  Verify that each entry within packages.yml (and their transitive dependencies) contains a file named dbt_project.yml
+dbt_parse_exit=2
+```
+
+The workflow was changed to `dbt parse --project-dir dbt --profiles-dir dbt`. Re-run with the
+exact same fresh-install command:
+
+```
+> docker run --rm -v "${PWD}:/work" -w /work -e WH_HOST=localhost -e WH_PORT=5432 \
+    -e WH_USER=postgres -e WH_PASSWORD=postgres -e WH_DB=postgres python:3.11-slim \
+    sh -c "pip install -q dbt-core==1.11.0 dbt-postgres==1.11.0 && dbt parse --project-dir dbt --profiles-dir dbt"
+WARNING: The candidate selected for download or install is a yanked version: 'dbt-core' candidate (version 1.11.0 ...)
+Reason for being yanked: Some install issues with required dependency bounds
+14:43:51  Running with dbt=1.11.0
+14:43:51  Registered adapter: postgres=1.11.0
+14:43:52  Unable to do partial parsing because profile has changed
+14:43:54  Performance info: dbt/target/perf_info.json
+dbt_parse_exit=0
+```
+
+The yanked-version notice is a pip warning, not a failure; the 1.11.0 pin is kept because it is
+the pin already used by `Dockerfile.airflow` (see 1.4).
+
+#### 5.2.4 docker compose config -q
+
+The real `.env` was backed up, `.env.example` copied over it, and the original restored in a
+`finally` block (hash comparison proves restoration):
+
+```
+> Copy-Item .env .env.phase5.bak -Force; Copy-Item .env.example .env -Force
+> docker compose config -q
+config_exit=0
+> Copy-Item .env.phase5.bak .env -Force; Remove-Item .env.phase5.bak -Force
+.env_restored=True
+git ls-files .env -> ''
+```
+
+#### 5.2.5 docker compose build
+
+```
+> docker compose build
+ Image streaming-pipeline-airflow:2.10.5-dbt1.11 Building
+ Image streaming-pipeline-app:1.0.0 Building
+ Image streaming-pipeline-spark:3.5.3 Building
+...
+#13 [airflow-init 2/2] RUN python -m venv /home/airflow/dbt_venv ... dbt-core==1.11.0 dbt-postgres==1.11.0
+#13 CACHED
+#14 [spark 2/2] RUN set -eux; cd /opt/spark/jars; ... curl -fsSL -O "${MAVEN}/${artifact}"; ...
+#14 CACHED
+[... intermediate BuildKit layer/export progress lines omitted here ...]
+#34 [dashboard] resolving provenance for metadata file DONE 0.0s
+ Image streaming-pipeline-spark:3.5.3 Built
+ Image streaming-pipeline-app:1.0.0 Built
+ Image streaming-pipeline-airflow:2.10.5-dbt1.11 Built
+ Image streaming-pipeline-app:1.0.0 Built
+ Image streaming-pipeline-airflow:2.10.5-dbt1.11 Built
+ Image streaming-pipeline-airflow:2.10.5-dbt1.11 Built
+ Image streaming-pipeline-app:1.0.0 Built
+build_exit=0
+```
+
+(The omitted block is ordinary BuildKit progress: context load, layer `CACHED` lines and manifest
+export. No step failed and no image tag uses `:latest` — see 5.4.)
+
+### 5.3 scripts/verify.ps1
+
+One command, seven checks, PASS/FAIL table, exit 1 if any check fails. Successful run:
+
+```
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
+
+Check                   Result Detail
+-----                   ------ ------
+services up/healthy     PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages      PASS   end offset=285062 (exit=0)
+lake raw/ticks objects  PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh PASS   rows=5436 max_ingested_at=2026-11-20 14:45:00 age_sec=60 (exit=0)
+dbt test passes         PASS   14:46:05  Done. PASS=15 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=15
+DAG exists & unpaused   PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200      PASS   HTTP 200 on port 8501
+
+SUMMARY: 7/7 checks passed
+verify_exit=0
+```
+
+FAIL path proved by stopping only the dashboard container (no data touched), running the script,
+then starting it again:
+
+```
+> docker compose stop dashboard
+ Container streaming-pipeline-dashboard-1 Stopping
+ Container streaming-pipeline-dashboard-1 Stopped
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
+services up/healthy     FAIL   dashboard missing
+...
+dashboard HTTP 200      FAIL   HTTP 0 on port 8501
+SUMMARY: 5/7 checks passed
+verify_failpath_exit=1
+> docker compose start dashboard
+ Container streaming-pipeline-warehouse-1 Waiting
+ Container streaming-pipeline-warehouse-1 Healthy
+ Container streaming-pipeline-dashboard-1 Starting
+ Container streaming-pipeline-dashboard-1 Started
+```
+
+After the dashboard reported healthy again, the full run passed once more (final state of the
+script verification):
+
+```
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
+Check                   Result Detail
+-----                   ------ ------
+services up/healthy     PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages      PASS   end offset=285377 (exit=0)
+lake raw/ticks objects  PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh PASS   rows=5446 max_ingested_at=2026-11-20 14:47:00 age_sec=3 (exit=0)
+dbt test passes         PASS   14:47:07  Done. PASS=15 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=15
+DAG exists & unpaused   PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200      PASS   HTTP 200 on port 8501
+
+SUMMARY: 7/7 checks passed
+verify_exit=0
+```
+
+### 5.4 Hygiene
+
+```
+> Select-String -Path docker-compose.yml,Dockerfile.app,Dockerfile.airflow,Dockerfile.spark -Pattern ':latest' -SimpleMatch
+NO ':latest' FOUND
+```
+
+`Select-String` is a PowerShell cmdlet, so `$LASTEXITCODE` is not meaningful here (it printed
+empty); the real evidence is the absence of matches.
+
+```
+> git ls-files .env
+['']
+> git ls-files .env.example
+['.env.example']
+> Select-String -Path .env.example -Pattern '^SOURCE='
+SOURCE=simulated
+```
+
+Before the README fix, `SOURCE=binance` was documented only implicitly (the file implied
+Binance was the default and simulated the fallback), which contradicted `.env.example`:
+
+```
+> Select-String -Path README.md -Pattern 'SOURCE=' | ForEach-Object { ... }
+README:61: If Binance is blocked in your region, set `SOURCE=simulated` in `.env` and run `docker compose up -d --force-recreate producer`.
+README:64: Set `SOURCE=simulated` and `SIM_EXTRA_SYMBOLS=500` to generate ~505 events/sec (5 base symbols + 500 extra), then record the numbers in the Results table.
+```
+
+After the fix (new "Verify everything" section and explicit optional-Binance wording):
+
+```
+> Select-String -Path README.md -Pattern 'SOURCE=|Verify everything|ci.yml|status badge' | ForEach-Object { ... }
+README:61: `SOURCE=simulated` is the default (offline and reproducible, see `.env.example`). Using live
+README:62: prices is **optional**: set `SOURCE=binance` in `.env` (the public API is geo-blocked in some
+README:64: or restore `SOURCE=simulated`.
+README:67: Set `SOURCE=simulated` and `SIM_EXTRA_SYMBOLS=500` to generate ~505 events/sec (5 base symbols + 500 extra), then record the numbers in the Results table.
+README:69: ## Verify everything
+README:81: CI runs on every push and pull request (`.github/workflows/ci.yml`): ruff, the 12 pytest unit
+README:83: those same steps run locally are in `VERIFICATION.md`. No status badge is included yet because
+```
+
+No badge URL was invented: the repo has not been pushed to GitHub.
+
+### 5.5 Decisions, deviations and honest notes
+
+- **Spark one-line change.** 5.2.1 is a real failure of the new ruff job, not a cosmetic edit:
+  `q_raw`, `q_dead` and `q_win` were assigned but never read (F841). The fix makes the existing
+  log line use those handles (`[q.name for q in (q_raw, q_dead, q_win)]`) instead of
+  `spark.streams.active`. No streaming logic, checkpoint, schema, producer, dbt model or test
+  was changed. The live Spark container was not restarted; the line only affects logging and
+  `docker compose build` (5.2.5) completed successfully.
+- **dbt parse CI command.** 5.2.3 was a real failure of my first workflow draft; adding
+  `--project-dir dbt` fixes it. No postgres service container is needed (5.1 proof).
+- **README wording.** This was a real documentation bug: `.env.example` defaults to
+  `SOURCE=simulated`, but the README implied Binance was the default. It now says simulated is
+  the default and `SOURCE=binance` is optional.
+- **Test/lint integrity.** No pytest test was weakened, deleted or skipped, and no ruff rule or
+  `select`/`ignore` setting was changed. The only new Python edit is the log line above.
+- **Safety.** No `rm -rf`, `docker compose down -v`, prune, or data deletion was used. The only
+  container interruption was the deliberate dashboard stop/start in 5.3, followed by a restored
+  7/7 verification. `.env` was temporarily replaced and restored byte-for-byte (5.2.4).
+- **Post-commit outputs.** As in Phase 4 (4.0/4.8), the final `git log --oneline -3`,
+  `git status --short` and `docker compose ps` are run after the commit and reported in the chat
+  response; they cannot be pasted into a file that is itself part of that commit.
+
+### 5.6 Phase 5 status (before commit)
+
+- [x] CI rewritten with five jobs: ruff, pytest (12 tests), dbt parse, compose config, compose build
+- [x] Old `py_compile` step removed
+- [x] All five CI steps run locally with real output pasted (two real failures found and fixed)
+- [x] `scripts/verify.ps1` prints a PASS/FAIL table, 7/7 pass, and exits 1 on failure (proved)
+- [x] Hygiene: no `:latest`, `.env` untracked, `.env.example` tracked and `SOURCE=simulated`
+- [x] README documents optional `SOURCE=binance`, verification command and CI; no invented badge
+- [x] No test weakened or deleted; no data deleted; stack left running and verified
