@@ -1,5 +1,7 @@
 # Real-Time Crypto Price Streaming Pipeline
 
+![CI](https://github.com/AhmedSaidRR/streaming-pipeline/actions/workflows/ci.yml/badge.svg)
+
 A local, end-to-end streaming data engineering project: a Python producer publishes crypto
 ticks (Binance or an offline simulator) into **Kafka**, **Spark Structured Streaming** validates
 them and writes raw Parquet to an **S3-compatible lake (SeaweedFS)**, 1-minute aggregated windows
