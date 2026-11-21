@@ -18,7 +18,7 @@ host: tests and dbt run inside containers.
 
 ```
 > py -0p
- -V:3.14 *  C:\Users\DELL\AppData\Local\Programs\Python\Python314\python.exe
+ -V:3.14 *  <user-home>\AppData\Local\Programs\Python\Python314\python.exe
 ```
 
 ### 0.2 Upstream blocker: MinIO images no longer exist
@@ -66,7 +66,7 @@ The folder was not a git repository.
 
 ```
 > git init -b main
-Initialized empty Git repository in D:/projects/streaming-pipeline/streaming-pipeline/.git/
+Initialized empty Git repository in <project-root>/.git/
 > git commit -m "chore: baseline snapshot before upgrade"
 c0043aa chore: baseline snapshot before upgrade
 ```
@@ -585,10 +585,10 @@ Final state: all nine services up, Spark still writing windows (`batch 127 writt
 
 ## Session-side notes
 
-- Bad-message files used: `C:\Users\DELL\AppData\Local\Temp\opencode\bad_messages_phase2_v2.txt`
+- Bad-message files used: `<temp>\opencode\bad_messages_phase2_v2.txt`
   and the `produce_all_bad.py` helper (current event time).
 - Diagnostic Spark classifier script:
-  `C:\Users\DELL\AppData\Local\Temp\opencode\diag_classifier.py`.
+  `<temp>\opencode\diag_classifier.py`.
 - Old dead-letter rows were copied to `dead_letter_evidence_backup/` in the lake before each
   checkpoint reset.
 - Local git identity is `Pipeline Dev <dev@localhost>` (repo-local only).
@@ -744,12 +744,12 @@ warehouse row.
 > $etStr = $et.ToString("yyyy-MM-ddTHH:mm:ss.ffffff+00:00")
 > $json = '{"symbol": "LATENCYPROBEUSDT", "price": 12345.67, "event_time": "' + $etStr + '", "source": "probe"}'
 > Set-Content -Path $probePath -Value $json -Encoding ascii
-probe_file=C:\Users\DELL\AppData\Local\Temp\latency_probe_phase3.txt
+probe_file=<temp>\latency_probe_phase3.txt
 event_time=2026-11-19T15:06:44.368926+00:00
 payload={"symbol": "LATENCYPROBEUSDT", "price": 12345.67, "event_time": "2026-11-19T15:06:44.368926+00:00", "source": "probe"}
 
 > docker compose cp $probePath kafka:/tmp/latency_probe.txt
- streaming-pipeline-kafka-1 Copied C:\Users\DELL\AppData\Local\Temp\latency_probe_phase3.txt to streaming-pipeline-kafka-1:/tmp/latency_probe.txt
+ streaming-pipeline-kafka-1 Copied <temp>\latency_probe_phase3.txt to streaming-pipeline-kafka-1:/tmp/latency_probe.txt
 > docker compose exec -T kafka sh -c "/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic crypto.prices < /tmp/latency_probe.txt"
 producer_exit=0
 ```
@@ -1557,7 +1557,7 @@ jobs:
       WH_HOST: localhost
       WH_PORT: "5432"
       WH_USER: postgres
-      WH_PASSWORD: postgres
+      WH_PASSWORD: ***
       WH_DB: postgres
     steps:
       - uses: actions/checkout@v4
@@ -1664,7 +1664,7 @@ cwd, not `dbt/`:
 
 ```
 > docker run --rm -v "${PWD}:/work" -w /work -e WH_HOST=localhost -e WH_PORT=5432 \
-    -e WH_USER=postgres -e WH_PASSWORD=postgres -e WH_DB=postgres python:3.11-slim \
+    -e WH_USER=postgres -e WH_PASSWORD=*** -e WH_DB=postgres python:3.11-slim \
     sh -c "pip install -q dbt-core==1.11.0 dbt-postgres==1.11.0 && dbt parse --profiles-dir dbt"
 14:42:27  Running with dbt=1.11.0
 14:42:27  Encountered an error:
@@ -1679,7 +1679,7 @@ exact same fresh-install command:
 
 ```
 > docker run --rm -v "${PWD}:/work" -w /work -e WH_HOST=localhost -e WH_PORT=5432 \
-    -e WH_USER=postgres -e WH_PASSWORD=postgres -e WH_DB=postgres python:3.11-slim \
+    -e WH_USER=postgres -e WH_PASSWORD=*** -e WH_DB=postgres python:3.11-slim \
     sh -c "pip install -q dbt-core==1.11.0 dbt-postgres==1.11.0 && dbt parse --project-dir dbt --profiles-dir dbt"
 WARNING: The candidate selected for download or install is a yanked version: 'dbt-core' candidate (version 1.11.0 ...)
 Reason for being yanked: Some install issues with required dependency bounds
@@ -2272,3 +2272,341 @@ README was invented: all figures quoted in this phase came from the commands abo
 - [x] `scripts/verify.ps1` extended -> 8/8 checks passed
 - [x] ruff clean; 12/12 original unit tests and 18/18 with new freshness tests
 - [x] README Observability section added; no Spark/producer logic, lint rule or test weakened
+
+---
+
+## Phase 7 — final polish
+
+All commands below were run on 2026-11-21 in this single session (PowerShell on Windows 11,
+Docker Desktop 29.8.0). Existing evidence above was left in place; the only changes to it are the
+publication sanitization described in 7.3 (personal paths -> placeholders, dummy credential-like
+literals -> `***`). Only documentation/hygiene files were changed: `README.md`, `VERIFICATION.md`,
+`.gitignore`, `LICENSE` (new) and `docs/INTERVIEW_NOTES.md` (new). No Spark, producer, dbt model,
+DAG, compose, SQL, pipeline logic or test was changed. No `rm -rf`, `docker compose down -v`, prune
+or data deletion was used.
+
+### 7.0 Step 0 — baseline
+
+```
+> git status --short
+(no output - clean working tree)
+
+> git log -3 --oneline
+d0e98d2 feat(obs): phase 6 pipeline metrics, freshness fix, dashboard health
+4f3ab0f ci: phase 5 workflow and verify script
+c9595f3 feat(dbt): phase 4 test cleanup and README fixes
+```
+
+```
+> docker compose ps
+NAME                                     IMAGE                                                                                         COMMAND                  SERVICE             CREATED          STATUS                    PORTS
+streaming-pipeline-airflow-db-1          postgres:16.16                                                                                "docker-entrypoint.s…"   airflow-db          2 days ago       Up 44 minutes (healthy)   5432/tcp
+streaming-pipeline-airflow-scheduler-1   sha256:7e426dc278cefc7693576d6663e380cea06113610baf44ef0d4d23177ce68167                       "/usr/bin/dumb-init …"   airflow-scheduler   2 days ago       Up 44 minutes (healthy)   8080/tcp
+streaming-pipeline-airflow-webserver-1   sha256:7e426dc278cefc7693576d6663e380cea06113610baf44ef0d4d23177ce68167                       "/usr/bin/dumb-init …"   airflow-webserver   2 days ago       Up 44 minutes (healthy)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+streaming-pipeline-dashboard-1           streaming-pipeline-app:1.0.0                                                                  "streamlit run dashb…"   dashboard           36 minutes ago   Up 36 minutes (healthy)   0.0.0.0:8501->8501/tcp, [::]:8501->8501/tcp
+streaming-pipeline-kafka-1               apache/kafka:3.8.0                                                                            "/__cacert_entrypoin…"   kafka               2 days ago       Up 44 minutes (healthy)   9092/tcp
+streaming-pipeline-lake-1                chrislusf/seaweedfs@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15   "/entrypoint.sh serv…"   lake                2 days ago       Up 44 minutes (healthy)   0.0.0.0:8333->8333/tcp, [::]:8333->8333/tcp, 0.0.0.0:8888->8888/tcp, [::]:8888->8888/tcp, 0.0.0.0:9333->9333/tcp, [::]:9333->9333/tcp
+streaming-pipeline-producer-1            sha256:4b2b693656e96ddbbf73037fc0444c6f9ca3ca09fecb82650cd732540ad42b12                       "python -m producer.…"   producer            2 days ago       Up 44 minutes
+streaming-pipeline-spark-1               sha256:4e05edf5805ccffab278d586b95b786d2feff2f51a812004cd13bae29b89dc7e                       "/opt/entrypoint.sh …"   spark               2 days ago       Up 44 minutes
+streaming-pipeline-warehouse-1           postgres:16.16                                                                                "docker-entrypoint.s…"   warehouse           2 days ago       Up 44 minutes (healthy)   0.0.0.0:5433->5432/tcp, [::]:5433->5432/tcp
+```
+
+All nine long-running services were already Up (seven healthy; producer/spark have no HTTP
+healthcheck), so no `docker compose up -d` was needed.
+
+```
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1; "verify_exit=$LASTEXITCODE"
+
+Check                        Result Detail
+-----                        ------ ------
+services up/healthy          PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages           PASS   end offset=302392 (exit=0)
+lake raw/ticks objects       PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh      PASS   rows=5731 max_ingested_at=2026-11-21 14:44:00 age_sec=41 (exit=0)
+dbt test passes              PASS   14:44:45  Done. PASS=24 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=24
+DAG exists & unpaused        PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200           PASS   HTTP 200 on port 8501
+pipeline_metrics lag <= 300s PASS   latest_ingested_at=2026-11-21 14:44:00 lag_sec=54 limit=300 (exit=0)
+
+SUMMARY: 8/8 checks passed
+verify_exit=0
+```
+
+### 7.1 Final README
+
+The README was rewritten in the requested order: title + one-paragraph summary, architecture
+(both mermaid blocks kept), measured Results, Quick start, Verify everything, Observability, Design
+decisions (including lessons learned), Limitations, Roadmap, Tests and Data note. Stale text removed:
+the "fill in after your own run" Results heading, the "Add screenshots" TODO, the checked-off SCD2
+roadmap item, and host-level `pip install` / `pytest` instructions that contradicted AGENTS.md
+(tests now show the container commands). The unsourced "every 5 min" wording in the diagram and
+quick start was changed to "scheduled" because that number is not in this file.
+
+```
+> Select-String -Path README.md -Pattern '^# ' | ForEach-Object { "$($_.LineNumber): $($_.Line)" }
+1: # Real-Time Crypto Price Streaming Pipeline
+> Select-String -Path README.md -Pattern '^## ' | ForEach-Object { "$($_.LineNumber): $($_.Line)" }
+12: ## Architecture
+47: ## Results (measured)
+63: ## Quick start
+95: ## Verify everything
+112: ## Observability
+141: ## Design decisions
+179: ## Limitations
+188: ## Roadmap
+195: ## Tests
+208: ## Data note
+```
+
+Every metric in the Results table is re-quoted from an existing section of this file (no new
+numbers): 8/8 (§6.4), ~507 events/s / N=505 / 31,310 / 61.72 s (§3.2), 135.641074 s (§3.3),
+5,093,976 B / 4.858 MiB / 12.88 h / ~9.05 MiB projection (§3.5), 4,136 windows (§3.5),
+24 dbt tests (§6.2), 12 unit tests / 18 with DAG tests (§6.5), 26–36 s cold boot (§1.2). The
+latency row explicitly says "by design" and the lake row explicitly says "projection".
+
+### 7.2 Interview notes
+
+```
+> Get-ChildItem docs | Select-Object Name,Length
+
+Name               Length
+----               ------
+INTERVIEW_NOTES.md   5690
+
+> (Select-String -Path docs/INTERVIEW_NOTES.md -Pattern '^### ').Count
+12
+```
+
+Twelve likely Data Engineering interview questions with short, honest answers, each citing the
+VERIFICATION.md section that supports it (Kafka, at-least-once, watermark/latency, DLQ and replay,
+sink failure, SCD2, idempotency, hardest bug, health checks, scale, do-differently, evidence).
+
+### 7.3 Publish hygiene
+
+Initial scan over `git ls-files` found five host user-profile paths and one host project path in
+this file, plus three dummy CI password literals. Replacements (no evidence line was deleted):
+
+| What was found | Where | Replacement |
+|---|---|---|
+| Host user-profile path in the `py -0p` output | §0.1 | `<user-home>\AppData\...` |
+| Host project path in the `git init` output | §0.3 | `<project-root>/.git/` |
+| Host temp path for the phase-2 bad-message file | Session-side notes | `<temp>\opencode\...` |
+| Host temp path for the classifier script | Session-side notes | `<temp>\opencode\...` |
+| Host temp path for the latency probe (command + `docker compose cp` output) | §3.3 | `<temp>\...` |
+| Dummy `postgres` CI password literals (no live DB connection; §5.1 proves `dbt parse` works with an unreachable host) | §5.1 workflow quote and two local-equivalent commands | `***` |
+
+Post-sanitization scans (paths shown repo-relative; no personal data remains):
+
+```
+> git ls-files | ForEach-Object { Select-String -Path $_ -Pattern 'C:\\Users|C:/Users|D:\\projects|D:/projects|DELL\\' ... }
+(no output)
+
+> Select-String -Path VERIFICATION.md -Pattern 'WH_PASSWORD=postgres|WH_PASSWORD: postgres'
+(no output)
+```
+
+Email and credential-like literals still present, all judged safe and left in place:
+
+```
+> (scan for emails over git ls-files)
+README.md:92: `a@b.com`, and the Flask secret `local-dev-secret-change-me`. They must be overridden in the local
+docker-compose.yml:165: --role Admin --email a@b.com || true)"
+
+> (scan for credential-like literals over git ls-files, abridged to the value-bearing lines)
+.env.example:14: S3_ACCESS_KEY=lakeadmin
+.env.example:15: S3_SECRET_KEY=lakeadmin123
+.env.example:20: WH_PASSWORD=warehouse
+.github/workflows/ci.yml:42: WH_PASSWORD: postgres
+docker-compose.yml:9: S3_ACCESS_KEY: ${S3_ACCESS_KEY:-lakeadmin}
+docker-compose.yml:10: S3_SECRET_KEY: ${S3_SECRET_KEY:-lakeadmin123}
+docker-compose.yml:16: WH_PASSWORD: ${WH_PASSWORD:-warehouse}
+docker-compose.yml:86: POSTGRES_PASSWORD: ${WH_PASSWORD:-warehouse}
+docker-compose.yml:145: POSTGRES_PASSWORD: airflow
+docker-compose.yml:164: (airflow users create --username admin --password admin --firstname a --lastname b
+docker-compose.yml:172: AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-local-dev-secret-change-me}
+infra/seaweedfs/s3.json:7: "accessKey": "lakeadmin",
+infra/seaweedfs/s3.json:8: "secretKey": "lakeadmin123"
+scripts/s3_client.py:12: aws_access_key_id=os.getenv("S3_ACCESS_KEY", "lakeadmin"),
+scripts/s3_client.py:13: aws_secret_access_key=os.getenv("S3_SECRET_KEY", "lakeadmin123"),
+spark/streaming_job.py:27: "password": os.getenv("WH_PASSWORD", "warehouse"),
+spark/streaming_job.py:43: .config("spark.hadoop.fs.s3a.access.key", os.getenv("S3_ACCESS_KEY", "lakeadmin"))
+spark/streaming_job.py:44: .config("spark.hadoop.fs.s3a.secret.key", os.getenv("S3_SECRET_KEY", "lakeadmin123"))
+```
+
+These are the local demo defaults permitted by the scope. The README "Demo defaults (local
+development only)" section now names every one of them explicitly (S3, warehouse, Airflow
+admin/admin with the dummy `a@b.com` email, and the Flask secret) and says they must be overridden
+in `.env` for any non-local use. No phone numbers were found by the phone-pattern scan. Git author
+identity is the local-only `Pipeline Dev <dev@localhost>`, not a personal address.
+
+```
+> git ls-files .env
+(no output)
+> git check-ignore -v .env
+.gitignore:1:.env	.env
+```
+
+`.env` is untracked and ignored; only `.env.example` is committed.
+
+### 7.4 .gitignore and status afterwards
+
+```
+> Get-Content .gitignore
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+.DS_Store
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+logs/
+dbt/.user.yml
+
+# Local scratch / temporary files (never publish these)
+*.tmp
+*.bak
+*.swp
+*~
+.env.local
+```
+
+It already covered `.env`, `.venv`, `__pycache__`, `.pytest_cache`, dbt `target/` and `logs/`;
+this phase added the local scratch/temp patterns (keeps artefacts like the phase-5 `.env.bak` out).
+
+```
+> git status --short
+ M .gitignore
+ M README.md
+ M VERIFICATION.md
+?? LICENSE
+?? docs/
+
+> git status --short --ignored | Select-Object -First 15
+ M .gitignore
+ M README.md
+ M VERIFICATION.md
+?? LICENSE
+?? docs/
+!! .env
+!! .pytest_cache/
+!! .ruff_cache/
+!! dags/__pycache__/
+!! dags/tests/__pycache__/
+!! dbt/.user.yml
+!! dbt/logs/
+!! dbt/target/
+!! logs/
+!! producer/__pycache__/
+!! scripts/__pycache__/
+!! tests/__pycache__/
+```
+
+### 7.5 LICENSE and architecture doc decision
+
+No LICENSE existed, so an MIT LICENSE was added with the placeholder copyright holder "Ahmed":
+
+```
+> Get-Content LICENSE | Select-Object -First 5
+MIT License
+
+Copyright (c) 2026 Ahmed
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+```
+
+`docs/` was empty before this phase. A separate `docs/ARCHITECTURE.md` was **not** added: the README
+already carries the mermaid architecture and ER diagrams, the data-model grain, the dead-letter and
+sink-failure paths, and all design decisions, so a second document would duplicate rather than add.
+`docs/INTERVIEW_NOTES.md` is the only file in `docs/`.
+
+### 7.6 Final checks
+
+Host Python is 3.14 and the pinned deps do not build there, so ruff and pytest ran in pinned
+Python 3.11 containers, as in phases 4–6.
+
+```
+> docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer sh -c "pip install -q ruff==0.6.4 && ruff check ."; "ruff_exit=$LASTEXITCODE"
+ Container streaming-pipeline-producer-run-ba8dc03701c3 Creating
+ Container streaming-pipeline-producer-run-ba8dc03701c3 Created
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+[notice] A new release of pip is available: 24.0 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+All checks passed!
+ruff_exit=0
+```
+
+```
+> docker compose run --rm --no-deps -v "${PWD}/tests:/app/tests" -v "${PWD}/dbt:/app/dbt" producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q"; "pytest_exit=$LASTEXITCODE"
+ Container streaming-pipeline-producer-run-f912bd287223 Creating
+ Container streaming-pipeline-producer-run-f912bd287223 Created
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+[notice] A new release of pip is available: 24.0 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+............                                                             [100%]
+12 passed in 1.03s
+pytest_exit=0
+```
+
+```
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1; "verify_exit=$LASTEXITCODE"
+
+Check                        Result Detail
+-----                        ------ ------
+services up/healthy          PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages           PASS   end offset=304047 (exit=0)
+lake raw/ticks objects       PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh      PASS   rows=5761 max_ingested_at=2026-11-21 14:50:00 age_sec=11 (exit=0)
+dbt test passes              PASS   14:50:16  Done. PASS=24 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=24
+DAG exists & unpaused        PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200           PASS   HTTP 200 on port 8501
+pipeline_metrics lag <= 300s PASS   latest_ingested_at=2026-11-21 14:50:00 lag_sec=21 limit=300 (exit=0)
+
+SUMMARY: 8/8 checks passed
+verify_exit=0
+```
+
+```
+> (git ls-files).Count
+55
+```
+
+That count is the tracked-file inventory **before** `git add -A`; the two new files (`LICENSE`,
+`docs/INTERVIEW_NOTES.md`) are added by the commit steps below, so the post-add count is reported
+in the chat response (it cannot be pasted into a file that is part of its own commit).
+
+### 7.7 Decisions, deviations and honest notes
+
+- **No questions asked, as instructed.** Ambiguities resolved conservatively: a separate architecture
+  doc was skipped to avoid duplicating the README; all credential-like literals were treated as
+  permitted local demo defaults and named explicitly instead of being removed; dummy CI password
+  literals in older evidence were masked rather than left as readable values.
+- **No invented numbers.** New observations in this section are only the outputs of the commands
+  shown (verify offsets/row counts/times, file counts, question count, test durations). All Results
+  figures in the README are re-quoted from sections 0.2, 0.6, 1.2, 3.2, 3.3, 3.5, 6.2, 6.4 and 6.5.
+- **Sanitization trade-off.** Replacing literals in pasted commands means those lines no longer
+  reproduce the exact keystrokes (e.g. a dummy password is now `***`). No claim, output or test
+  result was altered; the values were non-production dummy values and no real credential existed.
+- **No code or data changes.** Spark, producer, dbt models, DAG logic, compose files, SQL and tests
+  were not touched. `docker compose ps` shows the same nine services up before and after.
+- **verify.ps1 ran twice** (7.0 and 7.6), both 8/8; the second run is the final state.
+- **Post-commit outputs.** As in phases 4–6, `git log --oneline -3`, `git status --short`,
+  `docker compose ps`, the verify output and the post-add `git ls-files` count are run after the
+  commit and reported in the chat response.
+
+### 7.8 Phase 7 status (before commit)
+
+- [x] Step 0 recorded: clean tree, HEAD d0e98d2, nine services up, verify 8/8
+- [x] Final README with all requested sections, mermaid diagrams kept, measured Results, demo
+      defaults named, stale/contradictory text removed
+- [x] `docs/INTERVIEW_NOTES.md` with 12 evidence-cited questions
+- [x] Publish hygiene: personal paths replaced, dummy credential-like literals masked, emails and
+      local demo defaults reviewed and documented, `.env` confirmed untracked
+- [x] `.gitignore` covers env/venv/caches/dbt artefacts/temp files; status checked afterwards
+- [x] MIT `LICENSE` added with placeholder "Ahmed"; no duplicate architecture doc added
+- [x] Final checks: ruff clean, 12/12 unit tests, verify 8/8, `git ls-files` count recorded
+- [x] No step failed in Phase 7

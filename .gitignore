@@ -10,3 +10,10 @@ dbt/logs/
 dbt/dbt_packages/
 logs/
 dbt/.user.yml
+
+# Local scratch / temporary files (never publish these)
+*.tmp
+*.bak
+*.swp
+*~
+.env.local
