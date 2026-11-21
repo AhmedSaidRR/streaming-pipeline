@@ -2800,3 +2800,105 @@ is red. No CI fix was attempted without a log.
   the commit in the chat response.
 - No `rm -rf`, `docker compose down -v`, prune, or change to Spark/producer/dbt/DAG logic or tests
   was used in this section.
+
+### P.7 Commit-identity fix — placeholder 12345 replaced with real GitHub noreply ID
+
+The author/committer email on every commit used a placeholder `12345+` local part. This section
+records the rewrite to the real `208723650+` noreply identity (author **and** committer) on `main`.
+
+Step 0 — baseline:
+
+```
+> git status
+On branch main
+Your branch is up to date with 'origin/main'.
+nothing to commit, working tree clean
+> git log -1 --format="%an <%ae>"
+Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com>
+> git remote -v
+origin  https://github.com/AhmedSaidRR/streaming-pipeline.git (fetch)
+origin  https://github.com/AhmedSaidRR/streaming-pipeline.git (push)
+```
+
+Step 1 — local-only backup branch (never pushed):
+
+```
+> git branch backup-before-email-fix
+> git branch -v
+  backup-before-email-fix b31b0b4 docs: record GitHub publication and identity rewrite
+  backup-before-rewrite   edb1a47 docs: phase 7 final README, interview notes, publish hygiene
+* main                    b31b0b4 docs: record GitHub publication and identity rewrite
+```
+
+Steps 2-3 — helper script sourced by absolute path (filter-branch runs from a temp dir), rewrite
+of all 11 commits, then repo-local config and cleanup of the backup ref and helper:
+
+```
+> $env:FILTER_BRANCH_SQUELCH_WARNING=1
+> git filter-branch --env-filter '. /d/projects/streaming-pipeline/streaming-pipeline/_filter_env.sh' -- main
+Rewrite ecd068ef... (1/11) ... Rewrite b31b0b48... (9/11) ...
+Ref 'refs/heads/main' was rewritten
+> git config --local user.name "Ahmed Said"
+> git config --local user.email "208723650+AhmedSaidRR@users.noreply.github.com"
+> git update-ref -d refs/original/refs/heads/main
+> Remove-Item -Path _filter_env.sh -Force
+> git for-each-ref refs/original
+(no output)
+```
+
+Helper script (both guards match the old placeholder identity and export the new one):
+
+```sh
+if [ "$GIT_AUTHOR_NAME" = "Ahmed Said" ] && [ "$GIT_AUTHOR_EMAIL" = "12345+AhmedSaidRR@users.noreply.github.com" ]; then
+  export GIT_AUTHOR_NAME="Ahmed Said"
+  export GIT_AUTHOR_EMAIL="208723650+AhmedSaidRR@users.noreply.github.com"
+fi
+if [ "$GIT_COMMITTER_NAME" = "Ahmed Said" ] && [ "$GIT_COMMITTER_EMAIL" = "12345+AhmedSaidRR@users.noreply.github.com" ]; then
+  export GIT_COMMITTER_NAME="Ahmed Said"
+  export GIT_COMMITTER_EMAIL="208723650+AhmedSaidRR@users.noreply.github.com"
+fi
+```
+
+Proof — new author/committer identity on all 11 commits, and unchanged tree (quotes for PowerShell):
+
+```
+> git log --format="%h %an <%ae> | %cn <%ce>"
+4121824 Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+783a8cb Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+2ffc68a Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+75efe9a Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+4a75419 Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+b12ace5 Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+6fd536a Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+22a26bb Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+dfc5d72 Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+5e28286 Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+122d919 Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+> $bt = git rev-parse 'backup-before-email-fix^{tree}'; $ht = git rev-parse 'HEAD^{tree}'
+> "tree_equal = $($bt -eq $ht)"
+tree_equal = True
+```
+
+Step 4 — the single allowed force push (the repo is new and mine); no browser auth prompt appeared:
+
+```
+> git push --force-with-lease origin main
+To https://github.com/AhmedSaidRR/streaming-pipeline.git
+ + b31b0b4...4121824 main -> main (forced update)
+```
+
+Step 5 — remote verification; only `main` exists on the remote, backup branch was not pushed:
+
+```
+> git ls-remote origin
+41218242fa2ab55bb8f7b759bb5495bea848b3c7	HEAD
+41218242fa2ab55bb8f7b759bb5495bea848b3c7	refs/heads/main
+> git status -sb
+## main...origin/main
+> git log -1 --format="%an <%ae>"
+Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
+```
+
+Step 6 — this note is committed with the new identity and pushed normally (no force). No `rm -rf`,
+`docker compose down -v`, prune, or change to code/tests was used; `backup-before-email-fix` stays
+local-only.
