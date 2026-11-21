@@ -5,6 +5,8 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 
+from dashboard.queries import PIPELINE_METRICS_SQL, PIPELINE_WINDOWS_PER_HOUR_SQL
+
 st.set_page_config(page_title="Crypto Streaming Dashboard", layout="wide")
 
 
@@ -24,6 +26,25 @@ def query(sql: str, **params) -> pd.DataFrame:
 
 st.title("Real-Time Crypto Price Pipeline")
 st.caption("Kafka -> Spark Structured Streaming -> PostgreSQL -> dbt -> Streamlit")
+
+st.subheader("Pipeline health")
+try:
+    health = query(PIPELINE_METRICS_SQL)
+    if health.empty:
+        st.info("Pipeline metrics are not available yet.")
+    else:
+        h = health.iloc[0]
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Ingestion lag (s)", f"{h.ingestion_lag_seconds:.0f}")
+        c2.metric("Windows / hour (24h)", f"{h.windows_per_hour_last_24h:.1f}")
+        c3.metric("Avg commit lag (s)", f"{h.avg_commit_lag_seconds:.0f}")
+        c4.metric("Max commit lag (s)", f"{h.max_commit_lag_seconds:.0f}")
+        c5.metric("Latest ingested (UTC)", str(h.latest_ingested_at))
+        by_hour = query(PIPELINE_WINDOWS_PER_HOUR_SQL)
+        if not by_hour.empty:
+            st.bar_chart(by_hour.set_index("hour_start")["windows"])
+except Exception:
+    st.info("No pipeline metrics yet. Run the Airflow DAG (or `dbt run`) to create them.")
 
 try:
     symbols = query("select symbol from marts.dim_symbol order by symbol")["symbol"].tolist()

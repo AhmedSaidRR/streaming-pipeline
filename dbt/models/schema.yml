@@ -33,3 +33,21 @@ models:
     columns:
       - name: symbol
         tests: [not_null]
+  - name: pipeline_metrics
+    columns:
+      - name: latest_ingested_at
+        tests: [not_null]
+      - name: ingestion_lag_seconds
+        tests: [not_null]
+      - name: windows_last_24h
+        tests: [not_null]
+      - name: avg_commit_lag_seconds
+        tests: [not_null]
+      - name: max_commit_lag_seconds
+        tests: [not_null]
+  - name: pipeline_windows_per_hour
+    columns:
+      - name: hour_start
+        tests: [unique, not_null]
+      - name: windows
+        tests: [not_null]

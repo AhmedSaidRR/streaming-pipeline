@@ -70,9 +70,10 @@ Set `SOURCE=simulated` and `SIM_EXTRA_SYMBOLS=500` to generate ~505 events/sec (
 
 After `docker compose up -d` and a few minutes of data flow, one command checks the whole stack
 — all services up/healthy, Kafka has messages, lake has `raw/ticks` objects, `raw.price_windows`
-has fresh rows, `dbt test` passes, the `streaming_analytics` DAG exists and is unpaused, and the
-dashboard answers HTTP 200 on port 8501. It prints a PASS/FAIL table and exits 1 if anything
-fails; it does not modify data.
+has fresh rows, `dbt test` passes, the `streaming_analytics` DAG exists and is unpaused, the
+dashboard answers HTTP 200 on port 8501, and `marts.pipeline_metrics` reports ingestion lag
+within 5 minutes. It prints a PASS/FAIL table and exits 1 if anything fails; it does not
+modify data.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
@@ -82,6 +83,37 @@ CI runs on every push and pull request (`.github/workflows/ci.yml`): ruff, the 1
 tests, `dbt parse`, `docker compose config -q` and `docker compose build`. The real outputs of
 those same steps run locally are in `VERIFICATION.md`. No status badge is included yet because
 the repository has not been pushed to GitHub.
+
+## Observability
+
+The `check_stream_freshness` task in the DAG measures **ingestion lag** —
+`now() - max(raw.price_windows.ingested_at)` — rather than the age of `window_end`. It fails
+when the lag exceeds `FRESHNESS_MAX_LAG_SECONDS` (default `300`, i.e. 5 minutes), so a stalled
+stream stops the dbt run instead of quietly publishing stale marts.
+
+`dbt run` builds two views in `marts` (computed at query time, never stale):
+
+| View | Columns / purpose |
+|---|---|
+| `marts.pipeline_metrics` | `latest_ingested_at`, `ingestion_lag_seconds`, `windows_last_24h`, `windows_per_hour_last_24h` (count / 24), `avg_commit_lag_seconds` and `max_commit_lag_seconds` (`ingested_at - window_end`, over all rows) |
+| `marts.pipeline_windows_per_hour` | one row per hour with at least one ingested window in the last 24 h — powers the dashboard chart |
+
+The Streamlit **Pipeline health** section shows ingestion lag, windows/hour, average and max
+commit lag, and the per-hour chart. It uses the SQL constants in `dashboard/queries.py`;
+`scripts/verify.ps1` checks the same view (its eighth check: lag <= 300 s).
+
+How to read it:
+
+- Ingestion lag of a few seconds to ~60 s is healthy; approaching 300 s means Spark or the
+  JDBC sink has stopped committing.
+- Commit lag in the tens of seconds is expected (1-minute watermark + 30 s trigger + JDBC).
+  A large **max** usually means a window was replayed from the Spark checkpoint after a
+  restart, not a live delay.
+- A drop in windows/hour means fewer windows are being committed for the configured symbols.
+
+Dead-letter count is intentionally **not** a metric: dead letters are Parquet objects under
+`dead_letter/` in the S3 lake, not a SQL relation, so counting them from dbt would require an
+S3 scan. Inspect them in the lake UI or with `scripts/replay_dlq.py --dry-run`.
 
 ## SCD Type 2 demo (slowly changing dimension)
 

@@ -1868,3 +1868,407 @@ No badge URL was invented: the repo has not been pushed to GitHub.
 - [x] Hygiene: no `:latest`, `.env` untracked, `.env.example` tracked and `SOURCE=simulated`
 - [x] README documents optional `SOURCE=binance`, verification command and CI; no invented badge
 - [x] No test weakened or deleted; no data deleted; stack left running and verified
+
+---
+
+## Phase 6 — observability
+
+All commands below were run on 2026-11-21 in this single session (PowerShell on Windows 11,
+Docker Desktop 29.8.0, local time UTC+2 while container/database timestamps are UTC). ANSI
+colour codes were stripped from dbt output; the text is otherwise verbatim. No command printed
+a credential, so there is nothing to mask with `***` (Airflow's own task log masks some of its
+context values as `***`; that is the tool's redaction, pasted unchanged). Existing evidence
+above was left untouched. Only `dags/`, `dbt/`, `dashboard/`, `scripts/verify.ps1`, `README.md`
+and this file were edited. No Spark or producer logic was changed, no data was deleted, and
+neither `rm -rf`, `docker compose down -v` nor prune was used.
+
+### 6.0 Baseline (Step 0)
+
+```
+> git status --short; git log -3 --oneline
+4f3ab0f ci: phase 5 workflow and verify script
+c9595f3 feat(dbt): phase 4 test cleanup and README fixes
+8c50bad docs: phase 3 measured results (throughput, latency, windows, lake, tests)
+```
+(`git status --short` produced no output — clean working tree; HEAD is the approved Phase 5
+commit `4f3ab0f`.)
+
+```
+> docker compose ps
+NAME                                     IMAGE                                                                                         COMMAND                  SERVICE             CREATED        STATUS                        PORTS
+streaming-pipeline-airflow-db-1          postgres:16.16                                                                                "docker-entrypoint.s…"   airflow-db          2 days ago     Up About a minute (healthy)   5432/tcp
+streaming-pipeline-airflow-scheduler-1   sha256:7e426dc278cefc7693576d6663e380cea06113610baf44ef0d4d23177ce68167                       "/usr/bin/dumb-init …"   airflow-scheduler   2 days ago     Up About a minute (healthy)   8080/tcp
+streaming-pipeline-airflow-webserver-1   sha256:7e426dc278cefc7693576d6663e380cea06113610baf44ef0d4d23177ce68167                       "/usr/bin/dumb-init …"   airflow-webserver   2 days ago     Up About a minute (healthy)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+streaming-pipeline-dashboard-1           sha256:4b2b693656e96ddbbf73037fc0444c6f9ca3ca09fecb82650cd732540ad42b12                       "streamlit run dashb…"   dashboard           2 days ago     Up About a minute (healthy)   0.0.0.0:8501->8501/tcp, [::]:8501->8501/tcp
+streaming-pipeline-kafka-1               apache/kafka:3.8.0                                                                            "/__cacert_entrypoin…"   kafka               2 days ago     Up About a minute (healthy)   9092/tcp
+streaming-pipeline-lake-1                chrislusf/seaweedfs@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15   "/entrypoint.sh serv…"   lake                2 days ago     Up About a minute (healthy)   0.0.0.0:8333->8333/tcp, [::]:8333->8333/tcp, 0.0.0.0:8888->8888/tcp, [::]:8888->8888/tcp, 0.0.0.0:9333->9333/tcp, [::]:9333->9333/tcp
+streaming-pipeline-producer-1            sha256:4b2b693656e96ddbbf73037fc0444c6f9ca3ca09fecb82650cd732540ad42b12                       "python -m producer.…"   producer            47 hours ago   Up About a minute
+streaming-pipeline-spark-1               sha256:4e05edf5805ccffab278d586b95b786d2feff2f51a812004cd13bae29b89dc7e                       "/opt/entrypoint.sh …"   spark               2 days ago     Up About a minute
+streaming-pipeline-warehouse-1           postgres:16.16                                                                                "docker-entrypoint.s…"   warehouse           2 days ago     Up About a minute (healthy)   0.0.0.0:5433->5432/tcp, [::]:5433->5432/tcp
+```
+
+All nine long-running services were already Up, so no `docker compose up -d` was needed.
+
+```
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
+
+Check                   Result Detail
+-----                   ------ ------
+services up/healthy     PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages      PASS   end offset=289467 (exit=0)
+lake raw/ticks objects  PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh PASS   rows=5521 max_ingested_at=2026-11-21 14:01:00 age_sec=35 (exit=0)
+dbt test passes         PASS   14:01:40  Done. PASS=15 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=15
+DAG exists & unpaused   PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200      PASS   HTTP 200 on port 8501
+
+SUMMARY: 7/7 checks passed
+```
+
+### 6.1 Freshness check: `window_end` -> `ingested_at`, threshold from env var
+
+The old task in `dags/analytics_pipeline.py` measured the wrong thing (hard-coded 600 s and the
+age of the *window end*, which includes the deliberate watermark + trigger delay):
+
+```python
+MAX_LAG_SECONDS = 600
+...
+cur.execute("SELECT max(window_end) FROM raw.price_windows")
+...
+lag = (now - latest).total_seconds()
+```
+
+New logic. `dags/freshness.py` holds the pure, dependency-free helpers; the DAG queries
+`max(ingested_at)` and reads its limit from `FRESHNESS_MAX_LAG_SECONDS` (default 300 s):
+
+```python
+DEFAULT_MAX_LAG_SECONDS = 300
+MAX_LAG_ENV_VAR = "FRESHNESS_MAX_LAG_SECONDS"
+
+def assert_fresh(latest, now, max_lag_seconds: int) -> float:
+    if latest is None:
+        raise ValueError("raw.price_windows is empty: is the streaming job running?")
+    lag = ingestion_lag_seconds(latest, now)
+    if lag > max_lag_seconds:
+        raise ValueError(f"Stream is stale: newest ingested_at was {lag:.0f}s ago "
+                         f"(limit {max_lag_seconds}s)")
+    return lag
+```
+
+```python
+cur.execute("SELECT max(ingested_at) FROM raw.price_windows")
+latest = cur.fetchone()[0]
+now = datetime.now(timezone.utc).replace(tzinfo=None)
+lag = assert_fresh(latest, now, threshold)
+```
+
+The env var is unset in the deployment, so the default applies:
+
+```
+> docker compose exec -T airflow-scheduler printenv FRESHNESS_MAX_LAG_SECONDS; "env_var_exit=$LASTEXITCODE"
+env_var_exit=1
+```
+
+PASS with the default threshold (direct call to the deployed function; the DAG folder is
+volume-mounted, so no Airflow image rebuild was needed):
+
+```
+> docker compose exec -T airflow-scheduler sh -c "cd /opt/airflow/dags && python -c 'from analytics_pipeline import check_stream_freshness; print(check_stream_freshness())'"; "freshness_pass_exit=$LASTEXITCODE"
+Freshness OK: latest ingested_at=2026-11-21 14:07:00.016000, lag=14s (limit=300s)
+13.812879
+freshness_pass_exit=0
+```
+
+The real Airflow task also succeeds:
+
+```
+> docker compose exec -T airflow-webserver airflow tasks test streaming_analytics check_stream_freshness 2026-11-21 2>&1 | Select-Object -Last 22; "task_test_exit=$LASTEXITCODE"
+...
+[2026-11-21T14:10:44.056+0000] {taskinstance.py:732} INFO - ::endgroup::
+Freshness OK: latest ingested_at=2026-11-21 14:10:00.022000, lag=44s (limit=300s)
+[2026-11-21T14:10:44.102+0000] {python.py:240} INFO - Done. Returned value was: 44.080186
+[2026-11-21T14:10:44.111+0000] {taskinstance.py:341} INFO - ::group::Post task execution logs
+[2026-11-21T14:10:44.112+0000] {taskinstance.py:353} INFO - Marking task as SUCCESS. dag_id=streaming_analytics, task_id=check_stream_freshness, run_id=__***_temporary_run_2026-11-21T14:10:43.660055+00:00__, execution_date=20261121T000000, start_date=, end_date=20261121T141044
+task_test_exit=0
+```
+
+SAFE FAIL proof — only the threshold was changed (to 1 s) via the env var for one `exec`;
+Spark was not stopped, no table or row was touched:
+
+```
+> docker compose exec -T -e FRESHNESS_MAX_LAG_SECONDS=1 airflow-scheduler sh -c "cd /opt/airflow/dags && python -c 'from analytics_pipeline import check_stream_freshness; check_stream_freshness()'" 2>&1 | ForEach-Object { "$_" }; "freshness_fail_exit=$LASTEXITCODE"
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/opt/airflow/dags/analytics_pipeline.py", line 27, in check_stream_freshness
+    lag = assert_fresh(latest, now, threshold)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/airflow/dags/freshness.py", line 31, in assert_fresh
+    raise ValueError(
+ValueError: Stream is stale: newest ingested_at was 48s ago (limit 1s)
+freshness_fail_exit=1
+```
+
+A first attempt at the PASS proof failed on my shell quoting (`%: 1: Syntax error: Unterminated
+quoted string`, exit 2); the retry above uses a quote-free one-liner and is the real result.
+
+One real problem found and fixed during this phase: Airflow's DagBag initially parsed the new
+unit-test file as a DAG and reported `ModuleNotFoundError: No module named 'pytest'`. Adding
+`dags/.airflowignore` with `tests/` removed it — no test was deleted or weakened:
+
+```
+> docker compose exec -T airflow-webserver airflow dags list-import-errors; "import_errors_exit=$LASTEXITCODE"
+No data found
+import_errors_exit=0
+```
+
+### 6.2 `pipeline_metrics` and `pipeline_windows_per_hour` (dbt)
+
+Two new views under `dbt/models/marts/`, both `materialized='view'` so "now" is evaluated at
+query time. `windows_per_hour_last_24h` is defined as `windows_last_24h / 24`; commit lag is
+`ingested_at - window_end` over all deduplicated rows (staging view), not just the last 24 h.
+Dead letters are **not** counted: they are Parquet objects under `dead_letter/` in the S3 lake,
+not a SQL relation, and counting them from dbt would require an S3 scan.
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler /home/airflow/dbt_venv/bin/dbt run --profiles-dir /opt/airflow/dbt 2>&1 | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }; "dbt_run_exit=$LASTEXITCODE"
+14:07:29  Running with dbt=1.11.0
+14:07:29  Registered adapter: postgres=1.11.0
+14:07:31  Found 8 models, 1 snapshot, 24 data tests, 1 seed, 1 source, 479 macros
+14:07:31
+14:07:31  Concurrency: 2 threads (target='dev')
+14:07:31
+14:07:31  1 of 8 START sql table model marts.mart_symbol_history ......................... [RUN]
+14:07:31  2 of 8 START sql view model staging.stg_price_windows .......................... [RUN]
+14:07:32  2 of 8 OK created sql view model staging.stg_price_windows ..................... [CREATE VIEW in 0.29s]
+14:07:32  1 of 8 OK created sql table model marts.mart_symbol_history .................... [SELECT 5 in 0.29s]
+14:07:32  3 of 8 START sql table model marts.dim_symbol .................................. [RUN]
+14:07:32  4 of 8 START sql view model marts.pipeline_metrics ............................. [RUN]
+14:07:32  4 of 8 OK created sql view model marts.pipeline_metrics ........................ [CREATE VIEW in 0.10s]
+14:07:32  5 of 8 START sql view model marts.pipeline_windows_per_hour .................... [RUN]
+14:07:32  3 of 8 OK created sql table model marts.dim_symbol ............................. [SELECT 506 in 0.15s]
+14:07:32  6 of 8 START sql table model marts.fct_price_1m ................................ [RUN]
+14:07:32  5 of 8 OK created sql view model marts.pipeline_windows_per_hour ............... [CREATE VIEW in 0.11s]
+14:07:32  6 of 8 OK created sql table model marts.fct_price_1m ........................... [SELECT 5546 in 0.20s]
+14:07:32  7 of 8 START sql table model marts.mart_hourly_prices .......................... [RUN]
+14:07:32  8 of 8 START sql table model marts.mart_volatility_alerts ...................... [RUN]
+14:07:32  8 of 8 OK created sql table model marts.mart_volatility_alerts ................. [SELECT 138 in 0.12s]
+14:07:32  7 of 8 OK created sql table model marts.mart_hourly_prices ..................... [SELECT 531 in 0.14s]
+14:07:32
+14:07:32  Finished running 5 table models, 3 view models in 0 hours 0 minutes and 1.08 seconds (1.08s).
+14:07:32
+14:07:32  Completed successfully
+14:07:32
+14:07:32  Done. PASS=8 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=8
+dbt_run_exit=0
+```
+
+Tests added: `not_null` on all six `pipeline_metrics` columns, `unique` + `not_null` on
+`pipeline_windows_per_hour.hour_start`, `not_null` on `.windows`, and a singular test
+`assert_pipeline_metrics_sane` (negative lag, or max < avg, or zero windows => fail).
+15 -> 24 data tests.
+
+```
+> docker compose exec -T -w /opt/airflow/dbt airflow-scheduler /home/airflow/dbt_venv/bin/dbt test --profiles-dir /opt/airflow/dbt 2>&1 | ForEach-Object { $_ -replace "\x1b\[[0-9;]*m","" }; "dbt_test_exit=$LASTEXITCODE"
+14:07:46  Running with dbt=1.11.0
+14:07:46  Registered adapter: postgres=1.11.0
+14:07:46  Found 8 models, 1 snapshot, 24 data tests, 1 seed, 1 source, 479 macros
+...
+14:07:46  2 of 24 PASS assert_pipeline_metrics_sane ...................................... [PASS in 0.12s]
+...
+14:07:47  11 of 24 PASS not_null_pipeline_metrics_avg_commit_lag_seconds ................. [PASS in 0.09s]
+14:07:46  12 of 24 PASS not_null_pipeline_metrics_ingestion_lag_seconds .................. [PASS in 0.08s]
+14:07:47  13 of 24 PASS not_null_pipeline_metrics_latest_ingested_at ..................... [PASS in 0.15s]
+14:07:47  14 of 24 PASS not_null_pipeline_metrics_max_commit_lag_seconds ................. [PASS in 0.15s]
+14:07:47  15 of 24 PASS not_null_pipeline_metrics_windows_last_24h ....................... [PASS in 0.10s]
+14:07:47  16 of 24 PASS not_null_pipeline_windows_per_hour_hour_start .................... [PASS in 0.11s]
+14:07:47  17 of 24 PASS not_null_pipeline_windows_per_hour_windows ....................... [PASS in 0.09s]
+14:07:47  24 of 24 PASS unique_pipeline_windows_per_hour_hour_start ...................... [PASS in 0.08s]
+14:07:47
+14:07:47  Finished running 24 data tests in 0 hours 0 minutes and 1.40 seconds (1.40s).
+14:07:47
+14:07:47  Completed successfully
+14:07:47
+14:07:47  Done. PASS=24 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=24
+dbt_test_exit=0
+```
+
+(The `...` lines are unchanged pre-existing tests from Phase 4; the complete run passed 24/24.)
+
+### 6.3 Streamlit "Pipeline health"
+
+The dashboard reads SQL constants from `dashboard/queries.py`; the new section shows ingestion
+lag, windows/hour (24 h average and per-hour bar chart), average and max commit lag, and latest
+ingested timestamp. Dashboard code is baked into `streaming-pipeline-app:1.0.0`, so only that
+service was rebuilt and recreated (the DAG is volume-mounted, so Airflow was not rebuilt):
+
+```
+> docker compose build dashboard; "build_exit=$LASTEXITCODE"
+#11 [6/7] COPY dashboard ./dashboard
+#11 DONE 0.0s
+ Image streaming-pipeline-app:1.0.0 Built
+build_exit=0
+
+> docker compose up -d --no-deps dashboard; "up_exit=$LASTEXITCODE"
+ Container streaming-pipeline-dashboard-1 Recreate
+ Container streaming-pipeline-dashboard-1 Recreated
+ Container streaming-pipeline-dashboard-1 Starting
+ Container streaming-pipeline-dashboard-1 Started
+up_exit=0
+```
+
+HTTP check after the rebuild:
+
+```
+> (poll docker compose ps for dashboard healthy, 3 s interval)
+dashboard_status=dashboard|Up 15 seconds (healthy)
+> (Invoke-WebRequest http://localhost:8501)
+dashboard_http=200
+```
+
+The exact SQL constants used by the dashboard were executed inside the dashboard container
+(without starting Streamlit), via a temp script copied to `/tmp`; no credential is printed:
+
+```
+> docker compose cp <temp>\phase6_dashboard_metrics.py dashboard:/tmp/phase6_dashboard_metrics.py
+> docker compose exec -T -e PYTHONPATH=/app dashboard python /tmp/phase6_dashboard_metrics.py; "dashboard_metrics_exit=$LASTEXITCODE"
+     latest_ingested_at  ingestion_lag_seconds  windows_last_24h  windows_per_hour_last_24h  avg_commit_lag_seconds  max_commit_lag_seconds
+2026-11-21 14:09:00.011                   13.2               175                       7.29                   668.0                 82980.0
+hourly_rows=2 first_hour=2026-11-20 14:00:00 last_hour=2026-11-21 14:00:00
+dashboard_metrics_exit=0
+```
+
+Direct psql query of the same views (run immediately afterwards):
+
+```
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "select * from marts.pipeline_metrics;"
+   latest_ingested_at    | ingestion_lag_seconds | windows_last_24h | windows_per_hour_last_24h | avg_commit_lag_seconds | max_commit_lag_seconds
+-------------------------+-----------------------+------------------+---------------------------+------------------------+------------------------
+ 2026-11-21 14:09:00.011 |                  33.9 |              175 |                      7.29 |                   668.0 |                82980.0
+(1 row)
+
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "select hour_start, windows from marts.pipeline_windows_per_hour order by hour_start;"
+     hour_start      | windows
+---------------------+---------
+ 2026-11-20 14:00:00 |     125
+ 2026-11-21 14:00:00 |      50
+(2 rows)
+```
+
+`latest_ingested_at`, `windows_last_24h`, `windows_per_hour_last_24h`, `avg_commit_lag_seconds`
+and `max_commit_lag_seconds` match exactly. `ingestion_lag_seconds` differs (13.2 vs 33.9) only
+because the view computes `now()` at query time and the two queries were ~20 s apart; it is the
+same expression. Streamlit logged no exception after the rebuild (`docker compose logs --tail 25
+dashboard`: only "You can now view your Streamlit app in your browser", URL http://0.0.0.0:8501).
+
+The large `max_commit_lag_seconds` (82,980 s) is real: a window from the previous day was
+committed late after a Spark restart. Source check:
+
+```
+> docker compose exec -T warehouse psql -U warehouse -d warehouse -c "select count(*) as all_rows, round(avg(extract(epoch from (ingested_at-window_end)))::numeric,1) as avg_lag_all, round(max(extract(epoch from (ingested_at-window_end)))::numeric,1) as max_lag_all, count(*) filter (where ingested_at > now()-interval '24 hours') as rows_24h, round(avg(extract(epoch from (ingested_at-window_end))) filter (where ingested_at > now()-interval '24 hours')::numeric,1) as avg_lag_24h, round(max(extract(epoch from (ingested_at-window_end))) filter (where ingested_at > now()-interval '24 hours')::numeric,1) as max_lag_24h from raw.price_windows;"
+ all_rows | avg_lag_all | max_lag_all | rows_24h | avg_lag_24h | max_lag_24h
+----------+-------------+-------------+----------+-------------+-------------
+     5556 |       668.0 |     82980.0 |      175 |     14185.7 |     82980.0
+(1 row)
+```
+
+### 6.4 `scripts/verify.ps1` — eighth check
+
+```
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1; "verify_exit=$LASTEXITCODE"
+
+Check                        Result Detail
+-----                        ------ ------
+services up/healthy          PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages           PASS   end offset=291967 (exit=0)
+lake raw/ticks objects       PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh      PASS   rows=5556 max_ingested_at=2026-11-21 14:09:00 age_sec=55 (exit=0)
+dbt test passes              PASS   14:09:59  Done. PASS=24 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=24
+DAG exists & unpaused        PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200           PASS   HTTP 200 on port 8501
+pipeline_metrics lag <= 300s PASS   latest_ingested_at=2026-11-21 14:10:00 lag_sec=5 limit=300 (exit=0)
+
+SUMMARY: 8/8 checks passed
+verify_exit=0
+```
+
+### 6.5 ruff and unit tests
+
+Host Python is 3.14, so ruff and pytest were run in pinned Python 3.11 containers, as in
+Phases 4 and 5. No lint rule, select/ignore setting, or existing test was changed or removed.
+
+```
+> docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer sh -c "pip install -q ruff==0.6.4 && ruff check ."; "ruff_exit=$LASTEXITCODE"
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+[notice] A new release of pip is available: 24.0 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+All checks passed!
+ruff_exit=0
+```
+
+Exact Phase 2 command — original 12 tests stay green (the new DAG tests live in `dags/tests`
+and are not collected without that mount):
+
+```
+> docker compose run --rm --no-deps -v "${PWD}/tests:/app/tests" -v "${PWD}/dbt:/app/dbt" producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q"; "pytest_exit=$LASTEXITCODE"
+............                                                             [100%]
+12 passed in 1.84s
+pytest_exit=0
+```
+
+New logic covered: the same command with `dags/` mounted collects the six freshness tests too
+(default/env threshold, lag arithmetic, fresh/stale/empty cases):
+
+```
+> docker compose run --rm --no-deps -v "${PWD}/tests:/app/tests" -v "${PWD}/dbt:/app/dbt" -v "${PWD}/dags:/app/dags" producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q"; "pytest_with_dags_exit=$LASTEXITCODE"
+..................                                                       [100%]
+18 passed in 1.88s
+pytest_with_dags_exit=0
+```
+
+(Pip root warnings / PowerShell `RemoteException` wrappers on stderr are not test errors;
+`passed` and exit 0 are the results.)
+
+### 6.6 README
+
+A short "Observability" section documents the freshness formula and env var, both views and
+their columns, the dashboard section, how to read the numbers, and why dead-letter count is
+omitted. The "Verify everything" paragraph now mentions the eighth check. No number in the
+README was invented: all figures quoted in this phase came from the commands above.
+
+### 6.7 Decisions, deviations and honest notes
+
+- **Interpretation of "windows per hour".** The scalar `windows_per_hour_last_24h` is
+  `windows_last_24h / 24` (an average rate); the actual per-hour series is the companion
+  `pipeline_windows_per_hour` view used by the chart. Both are provided so neither reading of
+  the request is lost.
+- **Commit lag scope.** `avg`/`max_commit_lag_seconds` are computed over all deduplicated rows
+  (the request attached "last 24 h" only to windows/hour). This makes them lifetime stats;
+  a Spark restart replay can push the max up, as seen in 6.3. README explains how to read it.
+- **No dead-letter count.** Dead letters are Parquet in the S3 lake, with no cheap SQL path from
+  dbt. Added no fake/zero column; omitted it and documented why, as the task permits.
+- **Rebuild scope.** The DAG is bind-mounted (`./dags:/opt/airflow/dags`), so Airflow was not
+  rebuilt. Only `dashboard` was rebuilt/recreated. The app image tag is shared with producer
+  and lake-init, but those containers were not recreated and their code was not changed.
+- **View vs table.** Both new models are views so lag reflects the moment of the query. The
+  consequence (lag differs between two queries seconds apart) is shown explicitly in 6.3.
+- **Ambiguous failure proof.** "Tiny threshold" was implemented with `-e
+  FRESHNESS_MAX_LAG_SECONDS=1` on a single `docker compose exec`; this exercises the real env
+  var path and the real function, without touching Spark, checkpoints or data.
+- **Quoting and import-error retries.** Two first attempts failed (6.1): a shell-quoting error
+  in the PASS proof and Airflow parsing the new test file. Both were fixed and the successful
+  retries are pasted. The earlier outputs are quoted honestly rather than hidden.
+- **Post-commit outputs.** As in Phases 4 and 5, the final `git log --oneline -3`,
+  `git status --short`, `docker compose ps` and `scripts/verify.ps1` run *after* the commit are
+  reported in the chat response; they cannot be pasted into a file that is part of that commit.
+
+### 6.8 Phase 6 status (before commit)
+
+- [x] Freshness measures `max(ingested_at)` with `FRESHNESS_MAX_LAG_SECONDS` (default 300 s);
+      PASS at 300 s, FAIL at 1 s, real Airflow task SUCCESS — all with live data untouched
+- [x] `pipeline_metrics` and `pipeline_windows_per_hour` views added with 9 new dbt tests;
+      `dbt run` 8/8 and `dbt test` 24/24 in `airflow-scheduler`
+- [x] Dashboard "Pipeline health" section rebuilt and serving HTTP 200; its SQL matches a
+      direct psql query (lag differs only by query time)
+- [x] `scripts/verify.ps1` extended -> 8/8 checks passed
+- [x] ruff clean; 12/12 original unit tests and 18/18 with new freshness tests
+- [x] README Observability section added; no Spark/producer logic, lint rule or test weakened

@@ -1,0 +1,2 @@
+# Unit tests are not DAGs; keep them out of Airflow's DagBag.
+tests/

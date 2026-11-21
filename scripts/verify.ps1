@@ -95,6 +95,21 @@ try {
 } catch { $dashCode = 0 }
 Add-Result "dashboard HTTP 200" ($dashCode -eq 200) "HTTP $dashCode on port 8501"
 
+# 8. pipeline_metrics view reports ingestion lag within the 5-minute threshold.
+$lagSql = "select coalesce(round(ingestion_lag_seconds::numeric)::text,'na') || '|' || coalesce(to_char(latest_ingested_at,'YYYY-MM-DD HH24:MI:SS'),'none') from marts.pipeline_metrics;"
+$metrics = @(docker compose exec -T warehouse psql -U warehouse -d warehouse -tAc $lagSql 2>&1 | ForEach-Object { "$_" })
+$metricsCode = $LASTEXITCODE
+$mrow = $metrics | Where-Object { $_ -match "\|" } | Select-Object -First 1
+if ($mrow) {
+    $mparts = $mrow.Trim().Split("|")
+    if ($mparts[0] -match "^\d+$") { $lagSec = [int]$mparts[0] } else { $lagSec = 999999 }
+    $mLatest = $mparts[1].Trim()
+} else {
+    $lagSec = 999999; $mLatest = "none"
+}
+Add-Result "pipeline_metrics lag <= 300s" ($metricsCode -eq 0 -and $lagSec -le 300) `
+    "latest_ingested_at=$mLatest lag_sec=$lagSec limit=300 (exit=$metricsCode)"
+
 $results | Format-Table -AutoSize -Wrap
 $failed = @($results | Where-Object { $_.Result -eq "FAIL" })
 Write-Output "SUMMARY: $($results.Count - $failed.Count)/$($results.Count) checks passed"
