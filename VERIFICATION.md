@@ -2610,3 +2610,193 @@ in the chat response (it cannot be pasted into a file that is part of its own co
 - [x] MIT `LICENSE` added with placeholder "Ahmed"; no duplicate architecture doc added
 - [x] Final checks: ruff clean, 12/12 unit tests, verify 8/8, `git ls-files` count recorded
 - [x] No step failed in Phase 7
+
+---
+
+## Publishing — GitHub publication
+
+All commands below were run on 2026-11-21 in this single session (PowerShell on Windows 11).
+This section documents the publication of the Phase 7 commit `edb1a47` to GitHub. No token or
+password was requested, printed or stored; Git Credential Manager handled authentication and no
+browser prompt appeared. No secret-pattern match occurred, so nothing needed masking (the only
+credential-like values are the documented local demo defaults from §7.3). The post-commit outputs
+(`git log`/`git status` after the Publishing commit) are reported in the chat response, since they
+cannot be pasted into a file that is part of their own commit.
+
+### P.0 Step 0 — baseline
+
+```
+> git status
+On branch main
+nothing to commit, working tree clean
+> git log -3 --oneline
+edb1a47 docs: phase 7 final README, interview notes, publish hygiene
+d0e98d2 feat(obs): phase 6 pipeline metrics, freshness fix, dashboard health
+4f3ab0f ci: phase 5 workflow and verify script
+> git remote -v
+(no output)
+> git config user.name
+Pipeline Dev
+> git config user.email
+dev@localhost
+> git branch -a
+* main
+```
+
+All ten commits had `Pipeline Dev <dev@localhost>` as both author and committer (full log
+checked before rewriting).
+
+### P.1 Step 1 — backup, identity rewrite, proof
+
+```
+> git branch backup-before-rewrite
+> git config user.name "Ahmed Said"
+> git config user.email "12345+AhmedSaidRR@users.noreply.github.com"
+> git config user.name
+Ahmed Said
+> git config user.email
+12345+AhmedSaidRR@users.noreply.github.com
+```
+
+Rewrite with `filter-branch`, changing author and committer only when both match the old local
+identity. The env-filter was sourced from a temporary helper file (removed afterwards) because
+PowerShell mangled the inline quoting and because `filter-branch` changes its working directory:
+
+```
+> $env:FILTER_BRANCH_SQUELCH_WARNING=1
+> git filter-branch --env-filter '. /d/projects/streaming-pipeline/streaming-pipeline/_filter_env.sh' -- main
+Rewrite c0043aa36317cdebc5418cc073473e03e9988ec8 (1/10) ...
+...
+Rewrite edb1a4790c156693d26244e362f982a267acd1cf (7/10) (2 seconds passed, remaining 0 predicted)
+Ref 'refs/heads/main' was rewritten
+```
+
+Helper script (both guards use the same new identity):
+
+```sh
+if [ "$GIT_AUTHOR_NAME" = "Pipeline Dev" ] && [ "$GIT_AUTHOR_EMAIL" = "dev@localhost" ]; then
+  export GIT_AUTHOR_NAME="Ahmed Said"
+  export GIT_AUTHOR_EMAIL="12345+AhmedSaidRR@users.noreply.github.com"
+fi
+if [ "$GIT_COMMITTER_NAME" = "Pipeline Dev" ] && [ "$GIT_COMMITTER_EMAIL" = "dev@localhost" ]; then
+  export GIT_COMMITTER_NAME="Ahmed Said"
+  export GIT_COMMITTER_EMAIL="12345+AhmedSaidRR@users.noreply.github.com"
+fi
+```
+
+Three first attempts failed and are reported honestly rather than hidden: an inline `--env-filter`
+was split by PowerShell argument parsing (`fatal: bad revision 'Dev ] && [ $GIT_AUTHOR_EMAIL =
+dev@localhost ]; then export GIT_AUTHOR_NAME=Ahmed'`, exit 1); running the helper with `sh
+./_filter_env.sh` failed because `filter-branch` runs from a temporary directory (`sh:
+./_filter_env.sh: No such file or directory`); and running it with an absolute path via `sh`
+produced `WARNING: Ref 'refs/heads/main' is unchanged` because the `export`s happened in a child
+shell and were lost. Sourcing the file (`.`) fixed the third case. No commit was lost: the backup
+branch still points at `edb1a47`.
+
+Proof — new identity on every commit:
+
+```
+> git log --format="%h %an <%ae> | %cn <%ce> %s"
+8ee4307 Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> docs: phase 7 final README, interview notes, publish hygiene
+8c3c8f7 Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> feat(obs): phase 6 pipeline metrics, freshness fix, dashboard health
+f7d1a7d Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> ci: phase 5 workflow and verify script
+1586762 Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> feat(dbt): phase 4 test cleanup and README fixes
+ac63488 Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> docs: phase 3 measured results (throughput, latency, windows, lake, tests)
+a96ca50 Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> feat(dlq): prove dead-letter reasons, replay repair and sink-failure recovery
+02d1609 Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> wip: phase 2 dead-letter and sink-failure handling (coded, partly verified)
+c7828d8 Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> fix(boot): deterministic cold start in ~30s and a working dbt/Airflow path
+28a5e61 Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> feat(lake): run the stack on SeaweedFS after MinIO images were removed upstream
+ecd068e Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> | Ahmed Said <12345+AhmedSaidRR@users.noreply.github.com> chore: baseline snapshot before upgrade
+```
+
+Proof — tree unchanged (note the quotes needed for PowerShell):
+
+```
+> $bt = git rev-parse 'backup-before-rewrite^{tree}'; $ht = git rev-parse 'HEAD^{tree}'
+> "backup-before-rewrite tree = $bt"
+backup-before-rewrite tree = d4595ebc18f2c0c0f28167200d2261022960e582
+> "HEAD tree                 = $ht"
+HEAD tree                 = d4595ebc18f2c0c0f28167200d2261022960e582
+> "tree_equal = $($bt -eq $ht)"
+tree_equal = True
+```
+
+Cleanup of the `filter-branch` backup ref and the temporary helper (no `rm -rf`):
+
+```
+> git update-ref -d refs/original/refs/heads/main
+> Remove-Item -Path _filter_env.sh -Force
+> git for-each-ref refs/original
+(no output)
+> git status --short
+(no output)
+> git branch -v
+  backup-before-rewrite edb1a47 docs: phase 7 final README, interview notes, publish hygiene
+* main                  8ee4307 docs: phase 7 final README, interview notes, publish hygiene
+```
+
+`backup-before-rewrite` stays local-only and was never pushed.
+
+### P.2 Step 2 — final secret check on tracked files
+
+```
+> git ls-files | findstr /i "\.env"
+.env.example
+> git grep -n -I -E 'BEGIN .* PRIVATE KEY|ghp_|AKIA|sk-'
+(no output; git_grep_exit=1, i.e. no matches)
+```
+
+A broader review (`PASSWORD|SECRET|accessKey|secretKey|TOKEN|api[_-]?key`) returned only the known
+local demo defaults from §7.3 — `lakeadmin`/`lakeadmin123`, `warehouse`, `airflow`, `postgres`
+(dummy CI value), `local-dev-secret-change-me` — plus their documentation in this file. Nothing
+that looks like a real credential was found, so the push proceeded.
+
+### P.3 Step 3 — remote and push
+
+```
+> git remote add origin https://github.com/AhmedSaidRR/streaming-pipeline.git
+> git remote -v
+origin  https://github.com/AhmedSaidRR/streaming-pipeline.git (fetch)
+origin  https://github.com/AhmedSaidRR/streaming-pipeline.git (push)
+> git push -u origin main
+To https://github.com/AhmedSaidRR/streaming-pipeline.git
+ * [new branch]      main -> main
+branch 'main' set up to track 'origin/main'.
+```
+
+No `--force` was used, no browser authentication prompt appeared, and the backup branch was not
+pushed.
+
+### P.4 Step 4 — verification
+
+```
+> git ls-remote origin
+8ee4307d35ed7e64d05790a69cdd5de79424ee03        HEAD
+8ee4307d35ed7e64d05790a69cdd5de79424ee03        refs/heads/main
+> git status -sb
+## main...origin/main
+> git log --oneline -3
+8ee4307 docs: phase 7 final README, interview notes, publish hygiene
+8c3c8f7 feat(obs): phase 6 pipeline metrics, freshness fix, dashboard health
+f7d1a7d ci: phase 5 workflow and verify script
+```
+
+Remote `HEAD` and `main` match the local `main`; only `main` exists on the remote.
+
+### P.5 Step 5 — CI
+
+`gh` is not installed and was not installed. Open
+https://github.com/AhmedSaidRR/streaming-pipeline/actions and paste the failing job log if any job
+is red. No CI fix was attempted without a log.
+
+### P.6 Decisions, deviations and honest notes
+
+- The rewrite covered only `main`, not `--all`, so the backup branch preserves the original
+  history and the tree comparison is meaningful. Author **and** committer were rewritten using
+  `GIT_AUTHOR_*` and `GIT_COMMITTER_*` in the env-filter.
+- The GitHub noreply email is a public identity, not a secret. No token, password or credential
+  was requested, printed or stored at any point.
+- The Publishing commit itself uses the new repo-local identity (`Ahmed Said`), verified after
+  the commit in the chat response.
+- No `rm -rf`, `docker compose down -v`, prune, or change to Spark/producer/dbt/DAG logic or tests
+  was used in this section.
