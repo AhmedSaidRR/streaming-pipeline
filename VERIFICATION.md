@@ -2902,3 +2902,58 @@ Ahmed Said <208723650+AhmedSaidRR@users.noreply.github.com>
 Step 6 — this note is committed with the new identity and pushed normally (no force). No `rm -rf`,
 `docker compose down -v`, prune, or change to code/tests was used; `backup-before-email-fix` stays
 local-only.
+
+---
+
+## README-only accuracy polish — command re-runs (2026-11-26)
+
+README.md was the only documentation file changed for the prose fixes (plus this note). No code,
+test, Docker or CI file was touched. The two `docker compose` commands from the README "Tests"
+section were run once, in PowerShell on Windows 11 with the stack already up. The README now
+splits them with bash backslash continuations; the commands below are the same commands in their
+single-line form, and the arguments are identical.
+
+```
+> docker compose run --rm --no-deps -v "${PWD}/tests:/app/tests" -v "${PWD}/dbt:/app/dbt" producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q"; "pytest_exit=$LASTEXITCODE"
+ Container streaming-pipeline-producer-run-c3804b7d0f9d Creating
+ Container streaming-pipeline-producer-run-c3804b7d0f9d Created
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+[notice] A new release of pip is available: 24.0 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+............                                                             [100%]
+12 passed in 1.13s
+pytest_exit=0
+```
+
+```
+> docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer sh -c "pip install -q ruff==0.6.4 && ruff check ."; "ruff_exit=$LASTEXITCODE"
+ Container streaming-pipeline-producer-run-da4f9f770be6 Creating
+ Container streaming-pipeline-producer-run-da4f9f770be6 Created
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+[notice] A new release of pip is available: 24.0 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+All checks passed!
+ruff_exit=0
+```
+
+CI's `python -m pytest -q` step runs from the repository root (`.github/workflows/ci.yml`), where
+`dags/tests/test_freshness.py` is present, so it collects those six tests too. The CI-equivalent
+command, run in the pinned producer container with the whole repository mounted, gives the actual
+count — 18, despite the job name "pytest (12 unit tests)":
+
+```
+> docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q"; "ci_equivalent_exit=$LASTEXITCODE"
+ Container streaming-pipeline-producer-run-2476dafa7745 Creating
+ Container streaming-pipeline-producer-run-2476dafa7745 Created
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+
+[notice] A new release of pip is available: 24.0 -> 26.3
+[notice] To update, run: pip install --upgrade pip
+..................                                                       [100%]
+18 passed in 2.18s
+ci_equivalent_exit=0
+```
+
+No `rm -rf`, `docker compose down -v`, prune, or change to code/tests/Docker/CI was used.

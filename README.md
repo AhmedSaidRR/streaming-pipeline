@@ -3,13 +3,13 @@
 ![CI](https://github.com/AhmedSaidRR/streaming-pipeline/actions/workflows/ci.yml/badge.svg)
 
 A local, end-to-end streaming data engineering project: a Python producer publishes crypto
-ticks (Binance or an offline simulator) into **Kafka**, **Spark Structured Streaming** validates
-them and writes raw Parquet to an **S3-compatible lake (SeaweedFS)**, 1-minute aggregated windows
-to **PostgreSQL**, and reason-tagged rejections to a dead-letter area. **dbt** turns the append-only
-warehouse table into deduplicated staging models, facts, dimensions, SCD2 history and pipeline
-metrics; **Airflow** gates the dbt run on a freshness check; and a **Streamlit** dashboard exposes
-the results and pipeline health. Everything runs in Docker Compose, is pinned by version or
-digest, and is verified by a single eight-check script.
+ticks (offline simulator by default, Binance optional) into **Kafka**, **Spark Structured
+Streaming** validates them and writes raw Parquet to an **S3-compatible lake (SeaweedFS)**,
+1-minute aggregated windows to **PostgreSQL**, and reason-tagged rejections to a dead-letter area.
+**dbt** turns the append-only warehouse table into deduplicated staging models, facts, dimensions,
+SCD2 history and pipeline metrics; **Airflow** gates the dbt run on a freshness check; and a
+**Streamlit** dashboard exposes the results and pipeline health. Everything runs in Docker Compose,
+is pinned by version or digest, and is verified by a single eight-check script.
 
 ## Architecture
 
@@ -55,11 +55,11 @@ except where the row says *projection*.
 |---|---|---|
 | End-to-end verification | **8/8 checks passed** | `scripts/verify.ps1`, §6.4 and Step 0 of the Phase 7 section |
 | Throughput (simulated, N=505) | **~507 events/s** | 31,310 events / 61.72 s from the Kafka end-offset delta; producer configured at 505 ticks/s (5 base symbols + `SIM_EXTRA_SYMBOLS=500`). §3.2 |
-| End-to-end latency (event → warehouse) | **135.641074 s** (2 m 15.6 s) | *By design*, not a target: 1-minute watermark + 30 s trigger + JDBC write, plus 5 s deliberately added to the probe's `event_time`. §0.6, §3.3 |
+| End-to-end latency (event → warehouse) | **~136 s (about 2 m 16 s)** (135.641074 s measured) | *By design*, not a target: 1-minute watermark + 30 s trigger + JDBC write, plus 5 s deliberately added to the probe's `event_time`. §0.6, §3.3 |
 | Raw data in lake | **5,093,976 B (4.858 MiB)** observed over 12.88 h → **~9.05 MiB / 24 h projection** | *A projection, not a measured 24-hour figure.* Mostly the 5-symbol load; the ~4 min N=505 burst is a small part of the window. §3.5 |
 | 1-minute windows in warehouse | **4,136** (first 02:16:00, last 15:07:00 UTC) | Snapshot taken during Phase 3. §3.5 |
 | dbt tests | **24 passed** (PASS=24, WARN=0, ERROR=0) | Nine observability tests were added in Phase 6 (15 → 24). §6.2, §6.4 |
-| Unit tests | **12 passed** | Phase 2 pytest command; 18 pass when `dags/` is mounted for the freshness tests. §6.5 |
+| Unit tests | **18 passed** by CI's `python -m pytest -q`; **12 passed** with the local `tests/`-only mount | 12 in tests/; 6 more freshness tests in dags/ (18 total) run locally when `dags/` is mounted — and CI's root-level command collects all 18 too, despite its job name "pytest (12 unit tests)". §6.5, §7.6 |
 | Full-stack cold boot | **26–36 s** | Four measured boots, jars baked into the image (no Maven/Ivy at startup). §1.2 |
 
 ## Quick start
@@ -106,10 +106,10 @@ prints a PASS/FAIL table and exits 1 on any failure; it does not modify data.
 powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
 ```
 
-CI runs on every push and PR (`.github/workflows/ci.yml`): ruff, the 12 pytest unit tests,
-`dbt parse`, `docker compose config -q` and `docker compose build`. Local equivalents of those
-steps are pasted in [VERIFICATION.md](VERIFICATION.md). No status badge is included because the
-repository has not been pushed to GitHub yet.
+CI runs on every push and PR (`.github/workflows/ci.yml`): ruff, `python -m pytest -q` (18 tests —
+12 in `tests/` plus 6 freshness tests in `dags/`, even though the job is named "pytest (12 unit
+tests)"), `dbt parse`, `docker compose config -q` and `docker compose build`. Local equivalents of
+those steps are pasted in [VERIFICATION.md](VERIFICATION.md).
 
 ## Observability
 
@@ -186,6 +186,9 @@ Lessons learned the hard way (each was reproduced and fixed, with evidence in VE
   reproducible; the Binance path is optional and was not the source of the measured results.
 - **No cloud deploy:** everything runs locally in Docker Compose; the S3 API is SeaweedFS, not AWS
   S3, and there is no infrastructure-as-code or production secret management.
+- **Windows-only verify script:** `scripts/verify.ps1` is PowerShell, so it runs on Windows only;
+  the checks it makes can be run by hand with the `docker compose` commands in
+  [VERIFICATION.md](VERIFICATION.md).
 
 ## Roadmap
 
@@ -197,11 +200,19 @@ Lessons learned the hard way (each was reproduced and fixed, with evidence in VE
 ## Tests
 
 Host Python is 3.14 and the pinned dependencies do not build there, so tests and lint run inside
-the producer image in containers:
+the producer image in containers. The long commands below are split with a **bash backslash**
+(`\`) for line continuation; in PowerShell use a trailing backtick (`` ` ``) instead. What they
+run is unchanged:
 
 ```bash
-docker compose run --rm --no-deps -v "${PWD}/tests:/app/tests" -v "${PWD}/dbt:/app/dbt" producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q"
-docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer sh -c "pip install -q ruff==0.6.4 && ruff check ."
+docker compose run --rm --no-deps \
+  -v "${PWD}/tests:/app/tests" \
+  -v "${PWD}/dbt:/app/dbt" \
+  producer sh -c "pip install -q pytest==8.3.2 && python -m pytest -q"
+docker compose run --rm --no-deps \
+  -v "${PWD}:/work" \
+  -w /work \
+  producer sh -c "pip install -q ruff==0.6.4 && ruff check ."
 ```
 
 dbt tests run inside Airflow (`dbt test`): not_null, unique, relationships, plus singular tests
@@ -209,5 +220,7 @@ and the pipeline-metrics sanity test.
 
 ## Data note
 
-Prices come from Binance's public market-data endpoint (no key, no personal data). This project is
-for learning and is not financial advice.
+By default the pipeline generates simulated prices (no real market data), and all measured results
+come from the simulator. Live prices are optional with `SOURCE=binance` (Binance public market-data
+endpoint, no API key, no personal data; availability depends on region). This project is for
+learning and is not financial advice.
