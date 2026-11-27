@@ -160,9 +160,7 @@ commit lag, and the per-hour chart. How to read it (§6.3):
 
 - Ingestion lag of a few seconds to about a minute is healthy; approaching 300 s means Spark or
   the JDBC sink has stopped committing.
-- Commit lag in the tens of seconds is expected (watermark + trigger + JDBC). A large **max**
-  usually means a window was replayed from the Spark checkpoint after a restart — the measured
-  82,980 s max came from a window committed late after a restart.
+- Commit lag in the tens of seconds is expected (watermark + trigger + JDBC). A large **max** usually means a window was replayed from the Spark checkpoint after a restart. The value depends on how long the stack was stopped: it was 82,980 s when first measured and 433,830 s (about 5 days) in the dashboard screenshot above.
 - A drop in windows/hour means fewer windows are being committed for the configured symbols.
 
 Dead-letter count is deliberately **not** a metric: dead letters are Parquet objects under
