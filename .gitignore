@@ -17,3 +17,5 @@ dbt/.user.yml
 *.swp
 *~
 .env.local
+
+docs/INTERVIEW_NOTES.md
