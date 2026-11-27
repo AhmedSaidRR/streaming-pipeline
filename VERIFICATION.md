@@ -2957,3 +2957,205 @@ ci_equivalent_exit=0
 ```
 
 No `rm -rf`, `docker compose down -v`, prune, or change to code/tests/Docker/CI was used.
+
+---
+
+## Screenshots and polish — real screenshots and CI label (2026-11-27)
+
+Scope for this session: only README.md, docs/images/, `.github/workflows/ci.yml` (job name only) and
+this appended section. No Spark, producer, dbt, DAG or test file was changed. Credentials are masked
+as `***`; no secret value is reproduced here.
+
+### Start state and preconditions
+
+```
+> git pull
+Already up to date.
+
+> git status
+On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+
+> git log -3
+a5873a9d391d99518107e424857a64a35750230b docs: readme accuracy fixes
+18f684fa1942afbe2699b97766f90c8492331c0e Update README.md
+c4977baeda751496956ef8b689196e3a23a921d3 docs: record commit-identity fix in VERIFICATION.md
+```
+
+`docker compose ps` showed all nine long-running services Up (airflow-db, airflow-scheduler,
+airflow-webserver, dashboard, kafka, lake, producer, spark, warehouse); no `up` was needed and
+`down -v` / prune were never used.
+
+First verification run:
+
+```
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
+Check                        Result Detail
+-----                        ------ ------
+services up/healthy          PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages           PASS   end offset=356537 (exit=0)
+lake raw/ticks objects       PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh      PASS   rows=6656 max_ingested_at=2026-11-27 00:29:00 age_sec=21 (exit=0)
+dbt test passes              PASS   00:29:25  Done. PASS=24 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=24
+DAG exists & unpaused        PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200           PASS   HTTP 200 on port 8501
+pipeline_metrics lag <= 300s PASS   latest_ingested_at=2026-11-27 00:29:00 lag_sec=30 limit=300 (exit=0)
+
+SUMMARY: 8/8 checks passed
+```
+
+DAG runs were checked; there was already at least one successful run, so no trigger was needed:
+
+```
+> docker compose exec -T airflow-webserver airflow dags list-runs -d streaming_analytics
+dag_id              | run_id                               | state   | execution_date            | start_date                       | end_date
+streaming_analytics | scheduled__2026-11-27T00:20:00+00:00 | success | 2026-11-27T00:20:00+00:00 | 2026-11-27T00:27:48.015044+00:00 | 2026-11-27T00:28:14.050240+00:00
+streaming_analytics | scheduled__2026-11-26T19:15:00+00:00 | success | 2026-11-26T19:15:00+00:00 | 2026-11-27T00:26:17.760190+00:00 | 2026-11-27T00:27:47.880035+00:00
+... (many further `success` rows; older `failed` rows also present)
+```
+
+### Headless browser toolchain
+
+A pinned Playwright image was used (exact tag, not `:latest`):
+
+```
+> docker manifest inspect mcr.microsoft.com/playwright/python:v1.49.1-noble | Select-Object -First 5
+{
+   "schemaVersion": 2,
+   "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+   "manifests": [
+      {
+> docker pull mcr.microsoft.com/playwright/python:v1.49.1-noble
+Digest: sha256:42e251ec3238672c931be6c3565ff279690ae072c3e22058128d0412494f6866
+Status: Downloaded newer image for mcr.microsoft.com/playwright/python:v1.49.1-noble
+```
+
+The image ships the browsers but not the Python binding, so the pinned package was installed at
+runtime (`pip install -q playwright==1.49.1`). All browser processes ran in Docker with
+`--add-host=host.docker.internal:host-gateway`, viewport 1440x900, `device_scale_factor=1`.
+
+### Finding: dashboard import-path bug (runtime-only workaround, no repo change)
+
+A first probe at http://localhost:8501 showed the Streamlit error page instead of the app:
+
+```
+> docker compose logs --tail=60 dashboard
+File "/app/dashboard/app.py", line 8, in <module>
+    from dashboard.queries import PIPELINE_METRICS_SQL, PIPELINE_WINDOWS_PER_HOUR_SQL
+ModuleNotFoundError: No module named 'dashboard'
+```
+
+`/app` is not on the Streamlit script runner's `sys.path`; a container-only check confirmed the
+cause and a container-only pathfile fixed it without touching any tracked file:
+
+```
+> docker compose exec -T dashboard env PYTHONPATH=/app python -c "import dashboard.queries; print('import ok')"
+import ok
+> docker compose cp "C:/Users/DELL/AppData/Local/Temp/opencode/zz_app_path.pth" dashboard:/usr/local/lib/python3.11/site-packages/zz_app_path.pth
+streaming-pipeline-dashboard-1 Copied ... to streaming-pipeline-dashboard-1:/usr/local/lib/python3.11/site-packages/zz_app_path.pth
+> docker compose restart dashboard
+Container streaming-pipeline-dashboard-1 Restarting
+Container streaming-pipeline-dashboard-1 Started
+```
+
+After the restart the real app rendered (`title Crypto Streaming Dashboard`, `Pipeline health
+visible`, 7 canvases). This shim lives only inside the running container: the repository was not
+modified and a permanent fix (e.g. setting PYTHONPATH in compose) is out of scope for this session.
+The dashboard HTTP 200 check in `verify.ps1` had passed even while the app was showing the error,
+so this bug was found by actually viewing the page, not by the verification script.
+
+### Capture runs
+
+```
+> docker run ... mcr.microsoft.com/playwright/python:v1.49.1-noble sh -c "pip install -q playwright==1.49.1 && python /work/capture_screenshots.py"
+dashboard.png: attempt 1 OK (52791 bytes)
+airflow-dag.png: attempt 1 FAILED: TimeoutError: Page.wait_for_function: Timeout 60000ms exceeded.
+airflow-dag.png: attempt 2 FAILED: TimeoutError: Page.wait_for_function: Timeout 60000ms exceeded.
+airflow-dag.png: attempt 3 FAILED: TimeoutError: Page.wait_for_function: Timeout 60000ms exceeded.
+airflow-dag.png: SKIPPED after 3 attempts (no placeholder written)
+lake.png: attempt 1 OK (28362 bytes)
+RESULTS: {'dashboard.png': True, 'airflow-dag.png': False, 'lake.png': True}
+```
+
+The Airflow failure was in my DOM assertion (`svg text`): the grid renders its summary inside a
+shadow DOM (`page.get_by_text` finds it; `page.content()` does not). A probe confirmed
+`text=Total success count 1` and the grid screenshot itself was fine. With the assertion corrected,
+a fresh capture of that one image succeeded (no placeholder was ever created):
+
+```
+> docker run ... sh -c "pip install -q playwright==1.49.1 && python /work/capture_airflow.py"
+airflow-dag.png: attempt 1 OK (109480 bytes)
+```
+
+Airflow login used the documented demo credentials, masked here as `***` / `***`.
+
+Final files (all well below the 600 KB / 614400-byte limit):
+
+```
+> Get-ChildItem docs/images/*.png | Select-Object Name,Length
+airflow-dag.png 109480
+dashboard.png    52791
+lake.png         28362
+```
+
+Each saved PNG was opened with the view tool and checked:
+
+- `docs/images/dashboard.png` — Real-Time Crypto Price Pipeline, "Pipeline health" heading,
+  Ingestion lag / Windows per hour / Avg and Max commit lag metrics, and the rendered
+  windows-per-hour bar chart. No personal data, browser tabs or profile.
+- `docs/images/airflow-dag.png` — Airflow grid view of `streaming_analytics` with green success
+  cells and "Total success 24" (one run was still running when captured). Only the demo `AB`
+  initials appear in the app header; no real name, e-mail or browser chrome.
+- `docs/images/lake.png` — SeaweedFS filer breadcrumb `buckets / datalake / raw` with the `ticks`
+  folder listed. No personal data, browser tabs or profile.
+
+### Final verification run and README text
+
+The README's `verify everything` code block is the unedited output of this run:
+
+```
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
+Check                        Result Detail
+-----                        ------ ------
+services up/healthy          PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages           PASS   end offset=363027 (exit=0)
+lake raw/ticks objects       PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh      PASS   rows=6761 max_ingested_at=2026-11-27 00:50:00 age_sec=58 (exit=0)
+dbt test passes              PASS   00:51:02  Done. PASS=24 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=24
+DAG exists & unpaused        PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200           PASS   HTTP 200 on port 8501
+pipeline_metrics lag <= 300s PASS   latest_ingested_at=2026-11-27 00:51:00 lag_sec=8 limit=300 (exit=0)
+
+SUMMARY: 8/8 checks passed
+```
+
+CI job label (only the `name:` line changed; steps untouched):
+
+```
+> git diff -- .github/workflows/ci.yml
+-    name: pytest (12 unit tests)
++    name: pytest (18 tests)
+```
+
+Repo-wide grep after the change (ripgrep via the grep tool, pattern
+`pytest \(12|CI.*12 (unit )?tests|12 (unit )?tests.*CI|CI runs 12`):
+
+```
+Found 4 matches
+VERIFICATION.md:
+  Line 1539:     name: pytest (12 unit tests)
+  Line 1864: - [x] CI rewritten with five jobs: ruff, pytest (12 tests), dbt parse, compose config, compose build
+  Line 2944: count — 18, despite the job name "pytest (12 unit tests)":
+  Line 3138: -    name: pytest (12 unit tests)
+```
+
+All four are historical evidence or the quoted diff in this appended note; README.md and the CI
+job `name:` line no longer claim 12 tests. VERIFICATION.md itself was not rewritten, only appended
+to.
+
+The final `git add -A`, `git commit -m "docs: add screenshots and fix CI job label"` and `git push`
+commands are executed after this note is written; their real output is shown in the session
+transcript and the resulting commit is verifiable with `git log --oneline -3`. No `rm -rf`,
+`docker compose down -v` or prune was used.

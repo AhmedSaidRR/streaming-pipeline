@@ -46,6 +46,17 @@ Grain of `fct_price_1m`: **one row per symbol per 1-minute window**. Also built:
 `mart_hourly_prices` (OHLC-style), `mart_volatility_alerts`, `mart_symbol_history` (SCD2),
 `pipeline_metrics` and `pipeline_windows_per_hour`.
 
+## Screenshots
+
+![Streamlit dashboard with the Pipeline health section and rendered charts](docs/images/dashboard.png)
+*Dashboard — "Pipeline health" metrics and the windows-per-hour chart.*
+
+![Airflow grid view of the streaming_analytics DAG with green successful runs](docs/images/airflow-dag.png)
+*Airflow — `streaming_analytics` grid view with successful (green) DAG runs.*
+
+![SeaweedFS filer listing the datalake/raw path with the ticks folder](docs/images/lake.png)
+*Lake — SeaweedFS filer listing `datalake/raw` with the `ticks` folder.*
+
 ## Results (measured)
 
 Every number below comes from a command in [VERIFICATION.md](VERIFICATION.md); none is estimated
@@ -59,7 +70,7 @@ except where the row says *projection*.
 | Raw data in lake | **5,093,976 B (4.858 MiB)** observed over 12.88 h → **~9.05 MiB / 24 h projection** | *A projection, not a measured 24-hour figure.* Mostly the 5-symbol load; the ~4 min N=505 burst is a small part of the window. §3.5 |
 | 1-minute windows in warehouse | **4,136** (first 02:16:00, last 15:07:00 UTC) | Snapshot taken during Phase 3. §3.5 |
 | dbt tests | **24 passed** (PASS=24, WARN=0, ERROR=0) | Nine observability tests were added in Phase 6 (15 → 24). §6.2, §6.4 |
-| Unit tests | **18 passed** by CI's `python -m pytest -q`; **12 passed** with the local `tests/`-only mount | 12 in tests/; 6 more freshness tests in dags/ (18 total) run locally when `dags/` is mounted — and CI's root-level command collects all 18 too, despite its job name "pytest (12 unit tests)". §6.5, §7.6 |
+| Unit tests | **18 passed** by CI's `python -m pytest -q`; **12 passed** with the local `tests/`-only mount | 12 in tests/; 6 more freshness tests in dags/ (18 total) run locally when `dags/` is mounted — CI's root-level command collects all 18 too, and the job is named "pytest (18 tests)". §6.5, §7.6 |
 | Full-stack cold boot | **26–36 s** | Four measured boots, jars baked into the image (no Maven/Ivy at startup). §1.2 |
 
 ## Quick start
@@ -106,10 +117,28 @@ prints a PASS/FAIL table and exits 1 on any failure; it does not modify data.
 powershell -ExecutionPolicy Bypass -File scripts/verify.ps1
 ```
 
+Real output from a run on 2026-11-27 (not edited):
+
+```text
+Check                        Result Detail
+-----                        ------ ------
+services up/healthy          PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages           PASS   end offset=363027 (exit=0)
+lake raw/ticks objects       PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh      PASS   rows=6761 max_ingested_at=2026-11-27 00:50:00 age_sec=58 (exit=0)
+dbt test passes              PASS   00:51:02  Done. PASS=24 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=24
+DAG exists & unpaused        PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200           PASS   HTTP 200 on port 8501
+pipeline_metrics lag <= 300s PASS   latest_ingested_at=2026-11-27 00:51:00 lag_sec=8 limit=300 (exit=0)
+
+
+SUMMARY: 8/8 checks passed
+```
+
 CI runs on every push and PR (`.github/workflows/ci.yml`): ruff, `python -m pytest -q` (18 tests —
-12 in `tests/` plus 6 freshness tests in `dags/`, even though the job is named "pytest (12 unit
-tests)"), `dbt parse`, `docker compose config -q` and `docker compose build`. Local equivalents of
-those steps are pasted in [VERIFICATION.md](VERIFICATION.md).
+12 in `tests/` plus 6 freshness tests in `dags/`; the job is named "pytest (18 tests)"), `dbt parse`,
+`docker compose config -q` and `docker compose build`. Local equivalents of those steps are pasted
+in [VERIFICATION.md](VERIFICATION.md).
 
 ## Observability
 
