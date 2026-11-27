@@ -230,6 +230,9 @@ services:
     command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
     environment:
       <<: *app-env
+      # Streamlit puts the script directory (/app/dashboard) on sys.path, not /app,
+      # so dashboard/app.py cannot import the dashboard package without this.
+      PYTHONPATH: /app
     depends_on:
       warehouse:
         condition: service_healthy

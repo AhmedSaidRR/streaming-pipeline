@@ -3159,3 +3159,381 @@ The final `git add -A`, `git commit -m "docs: add screenshots and fix CI job lab
 commands are executed after this note is written; their real output is shown in the session
 transcript and the resulting commit is verifiable with `git log --oneline -3`. No `rm -rf`,
 `docker compose down -v` or prune was used.
+
+---
+
+## Dashboard import fix — permanent PYTHONPATH, stronger verify check (2026-11-27)
+
+Scope: only `docker-compose.yml` (dashboard service), `scripts/verify.ps1`,
+`docs/images/dashboard.png` and this appended section. No Dockerfile, Spark, producer, dbt, DAG
+or test file was changed. No shim was used at any point in this session; the previous runtime
+`.pth` workaround is gone. No `rm -rf`, `docker compose down -v` or prune was used. The two final
+commands (`git add -A`, `git commit -m "fix(dashboard): import path and stronger verify check"`)
+and `git push`, plus the last `git log --oneline -3` / `git status -sb`, are reported in the chat
+response because a file cannot contain evidence about its own commit.
+
+### D.0 Baseline
+
+```
+> git pull
+Already up to date.
+
+> git log --oneline -3
+febf243 docs: add screenshots and fix CI job label
+a5873a9 docs: readme accuracy fixes
+18f684f Update README.md
+
+> git status -sb
+## main...origin/main
+
+> docker compose ps --format "table {{.Service}}\t{{.Status}}"
+SERVICE             STATUS
+airflow-db          Up 36 minutes (healthy)
+airflow-scheduler   Up 36 minutes (healthy)
+airflow-webserver   Up 36 minutes (healthy)
+dashboard           Up 21 minutes (healthy)
+kafka               Up 36 minutes (healthy)
+lake                Up 36 minutes (healthy)
+producer            Up 36 minutes
+spark               Up 36 minutes
+warehouse           Up 36 minutes (healthy)
+```
+
+### D.1 Reproduce with no shim: force-recreate from the image
+
+```
+> docker compose up -d --force-recreate dashboard; "up_exit=$LASTEXITCODE"
+ Container streaming-pipeline-warehouse-1 Running
+ Container streaming-pipeline-dashboard-1 Recreate
+ Container streaming-pipeline-dashboard-1 Recreated
+ Container streaming-pipeline-warehouse-1 Waiting
+ Container streaming-pipeline-warehouse-1 Healthy
+ Container streaming-pipeline-dashboard-1 Starting
+ Container streaming-pipeline-dashboard-1 Started
+up_exit=0
+
+> docker compose exec -T dashboard sh -c "ls /usr/local/lib/python3.11/site-packages/zz_app_path.pth 2>&1; echo shim_check_exit=$?"
+ls: cannot access '/usr/local/lib/python3.11/site-packages/zz_app_path.pth': No such file or directory
+shim_check_exit=True
+```
+
+(`$?` was expanded by PowerShell to `True`; the meaningful fact is the `ls` "No such file" line.)
+
+The startup log alone is silent (Streamlit executes the script only when a browser connects), so
+the pinned Playwright container was used to load the page and print its rendered body. Image
+`mcr.microsoft.com/playwright/python:v1.49.1-noble` with `pip install -q playwright==1.49.1`,
+`--add-host=host.docker.internal:host-gateway`, viewport 1440x900, device scale factor 1.
+
+```
+> docker run --rm --add-host=host.docker.internal:host-gateway -v "<temp>/opencode:/work:ro" -w /work mcr.microsoft.com/playwright/python:v1.49.1-noble sh -c "pip install -q playwright==1.49.1 && python /work/probe_import_repro.py" 2>&1; "probe_exit=$LASTEXITCODE"
+http_status 200
+--- PAGE BODY (first 2500 chars) ---
+ModuleNotFoundError: No module named 'dashboard'
+Traceback:
+File "/usr/local/lib/python3.11/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 88, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+File "/usr/local/lib/python3.11/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 590, in code_to_exec
+    exec(code, module.__dict__)
+File "/app/dashboard/app.py", line 8, in <module>
+    from dashboard.queries import PIPELINE_METRICS_SQL, PIPELINE_WINDOWS_PER_HOUR_SQL
+--- END PAGE BODY ---
+contains_Pipeline_health False
+contains_ModuleNotFoundError True
+contains_Traceback True
+VERDICT: FAIL
+Exit code: 1
+```
+
+After that page load, the container log shows the real exception:
+
+```
+> docker compose logs --tail 50 dashboard 2>&1; "logs_exit=$LASTEXITCODE"
+dashboard-1  |
+dashboard-1  | Collecting usage statistics. To deactivate, set browser.gatherUsageStats to false.
+dashboard-1  |
+dashboard-1  |
+dashboard-1  |   You can now view your Streamlit app in your browser.
+dashboard-1  |
+dashboard-1  |   URL: http://0.0.0.0:8501
+dashboard-1  |
+dashboard-1  | 2026-11-27 01:03:32.741 Uncaught app exception
+dashboard-1  | Traceback (most recent call last):
+dashboard-1  |   File "/usr/local/lib/python3.11/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 88, in exec_func_with_error_handling
+dashboard-1  |     result = func()
+dashboard-1  |              ^^^^^^
+dashboard-1  |   File "/usr/local/lib/python3.11/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 590, in code_to_exec
+dashboard-1  |     exec(code, module.__dict__)
+dashboard-1  |   File "/app/dashboard/app.py", line 8, in <module>
+dashboard-1  |     from dashboard.queries import PIPELINE_METRICS_SQL, PIPELINE_WINDOWS_PER_HOUR_SQL
+dashboard-1  | ModuleNotFoundError: No module named 'dashboard'
+logs_exit=0
+```
+
+Root cause: the app image has `WORKDIR /app` and `COPY dashboard ./dashboard`, and
+`dashboard/app.py` line 8 imports `dashboard.queries`. `streamlit run` is a console script whose
+own `sys.path[0]` is `/usr/local/bin`; Streamlit adds the *script's* directory (`/app/dashboard`)
+to the path, not the package parent `/app`. So the `dashboard` namespace package is not importable
+even though the file exists. The HTTP healthcheck and `verify.ps1`'s HTTP 200 check both passed
+while the page was an error page — HTTP status cannot detect this bug.
+
+### D.2 Fix in the repo and rebuild only what changed
+
+One scoped change to the dashboard service (two comment lines and one setting); the image itself
+was not changed:
+
+```
+> git diff -- docker-compose.yml
+diff --git a/docker-compose.yml b/docker-compose.yml
+index bd3be26..51cc831 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -230,6 +230,9 @@ services:
+     command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+     environment:
+       <<: *app-env
++      # Streamlit puts the script directory (/app/dashboard) on sys.path, not /app,
++      # so dashboard/app.py cannot import the dashboard package without this.
++      PYTHONPATH: /app
+     depends_on:
+       warehouse:
+         condition: service_healthy
+```
+
+```
+> docker compose build dashboard; "build_exit=$LASTEXITCODE"
+#7 [3/7] COPY requirements.txt .
+#7 CACHED
+#9 [6/7] COPY dashboard ./dashboard
+#9 CACHED
+#10 [4/7] RUN pip install --no-cache-dir -r requirements.txt
+#10 CACHED
+#13 exporting to image
+#13 exporting manifest sha256:a5462508ef23b7eafc8d7a975908d5a9e61dee4d487b0c28f92bc7ee0937da67 done
+#13 naming to docker.io/library/streaming-pipeline-app:1.0.0 done
+ Image streaming-pipeline-app:1.0.0 Built
+build_exit=0
+
+> docker compose up -d dashboard; "up_exit=$LASTEXITCODE"
+ Container streaming-pipeline-warehouse-1 Running
+ Container streaming-pipeline-dashboard-1 Recreate
+ Container streaming-pipeline-dashboard-1 Recreated
+ Container streaming-pipeline-warehouse-1 Waiting
+ Container streaming-pipeline-warehouse-1 Healthy
+ Container streaming-pipeline-dashboard-1 Starting
+ Container streaming-pipeline-dashboard-1 Started
+up_exit=0
+
+> docker compose exec -T dashboard sh -c 'echo PYTHONPATH=$PYTHONPATH; ls /usr/local/lib/python3.11/site-packages/zz_app_path.pth 2>&1 || echo shim_absent'
+PYTHONPATH=/app
+ls: cannot access '/usr/local/lib/python3.11/site-packages/zz_app_path.pth': No such file or directory
+shim_absent
+```
+
+### D.3 Proof the real page renders without the shim
+
+Same pinned Playwright container, now with explicit assertions:
+
+```
+> docker run --rm --add-host=host.docker.internal:host-gateway -v "<temp>/opencode:/work:ro" -w /work mcr.microsoft.com/playwright/python:v1.49.1-noble sh -c "pip install -q playwright==1.49.1 && python /work/verify_dashboard_import.py" 2>&1; "probe_exit=$LASTEXITCODE"
+http_status 200
+contains_Pipeline_health True
+contains_ModuleNotFoundError False
+contains_Traceback False
+ASSERTIONS: PASS
+probe_exit=0
+```
+
+An excerpt of the rendered body at that moment (verbatim lines, some blank lines removed):
+
+```
+Symbol
+BNBUSDT
+
+Last N minutes
+
+60
+10
+240
+
+Auto refresh (15s)
+
+Real-Time Crypto Price Pipeline
+
+Kafka -> Spark Structured Streaming -> PostgreSQL -> dbt -> Streamlit
+
+Pipeline health
+
+Ingestion lag (s)
+
+7
+
+Windows / hour (24h)
+
+27.5
+
+Avg commit lag (s)
+
+1566
+
+Max commit lag (s)
+
+433830
+
+Latest ingested (UTC)
+
+2026-11-27 01:05:00.004000
+```
+
+Logs after the fixed page load are clean:
+
+```
+> docker compose logs --tail 50 dashboard 2>&1; "logs_exit=$LASTEXITCODE"
+dashboard-1  |
+dashboard-1  | Collecting usage statistics. To deactivate, set browser.gatherUsageStats to false.
+dashboard-1  |
+dashboard-1  |
+dashboard-1  |   You can now view your Streamlit app in your browser.
+dashboard-1  |
+dashboard-1  |   URL: http://0.0.0.0:8501
+dashboard-1  |
+logs_exit=0
+```
+
+### D.4 `scripts/verify.ps1` — dashboard check also scans the logs
+
+Check 7 now reads `docker compose logs --tail 50 dashboard` and fails when either marker appears;
+the check count is still eight:
+
+```
+> git diff -- scripts/verify.ps1
+diff --git a/scripts/verify.ps1 b/scripts/verify.ps1
+index ddf4d35..b55f912 100644
+--- a/scripts/verify.ps1
++++ b/scripts/verify.ps1
+@@ -87,13 +87,17 @@ $dagLine = $dags | Where-Object { $_ -match "^\s*streaming_analytics\s*\|" } | S
+ Add-Result "DAG exists & unpaused" ($dagsCode -eq 0 -and $null -ne $dagLine -and $dagLine -match "\bFalse\b") `
+     $(if ($dagLine) { $dagLine.Trim() } else { "DAG not found (exit=$dagsCode)" })
+ 
+-# 7. Streamlit dashboard answers on port 8501.
++# 7. Streamlit dashboard answers on port 8501 and its recent logs have no import/traceback errors.
+ $dashCode = 0
+ try {
+     $resp = Invoke-WebRequest -Uri "http://localhost:8501" -UseBasicParsing -TimeoutSec 10
+     $dashCode = [int]$resp.StatusCode
+ } catch { $dashCode = 0 }
+-Add-Result "dashboard HTTP 200" ($dashCode -eq 200) "HTTP $dashCode on port 8501"
++$dashLogs = @(docker compose logs --tail 50 dashboard 2>&1 | ForEach-Object { "$_" })
++$logErrors = @($dashLogs | Where-Object { $_ -match "Traceback|ModuleNotFoundError" })
++$dashOk = ($dashCode -eq 200 -and $logErrors.Count -eq 0)
++$logDetail = if ($logErrors.Count -eq 0) { "logs clean (tail 50)" } else { "logs contain: " + ($logErrors -join "; ") }
++Add-Result "dashboard HTTP 200" $dashOk "HTTP $dashCode on port 8501; $logDetail"
+ 
+ # 8. pipeline_metrics view reports ingestion lag within the 5-minute threshold.
+ $lagSql = "select coalesce(round(ingestion_lag_seconds::numeric)::text,'na') || '|' || coalesce(to_char(latest_ingested_at,'YYYY-MM-DD HH24:MI:SS'),'none') from marts.pipeline_metrics;"
+
+The same regex applied to the two real pre-fix log lines from D.1 detects both:
+
+```
+> $before = @('dashboard-1  | 2026-11-27 01:03:32.741 Uncaught app exception','dashboard-1  | Traceback (most recent call last):','dashboard-1  | ModuleNotFoundError: No module named ''dashboard'''); $hits = @($before | Where-Object { $_ -match "Traceback|ModuleNotFoundError" }); "pre_fix_log_hits=$($hits.Count)"; $hits
+pre_fix_log_hits=2
+dashboard-1  | Traceback (most recent call last):
+dashboard-1  | ModuleNotFoundError: No module named 'dashboard'
+```
+
+Final full run of the script:
+
+```
+> powershell -ExecutionPolicy Bypass -File scripts/verify.ps1; "verify_exit=$LASTEXITCODE"
+
+Check                        Result Detail
+-----                        ------ ------
+services up/healthy          PASS   9/9 up (7 healthy + producer/spark)
+kafka has messages           PASS   end offset=368677 (exit=0)
+lake raw/ticks objects       PASS   5 event_date partition object(s) listed (exit=0)
+raw.price_windows fresh      PASS   rows=6856 max_ingested_at=2026-11-27 01:09:00 age_sec=49 (exit=0)
+dbt test passes              PASS   01:09:53  Done. PASS=24 WARN=0 ERROR=0 SKIP=0 NO-OP=0 TOTAL=24
+DAG exists & unpaused        PASS   streaming_analytics | /opt/airflow/dags/analytics_pipeline.py | airflow | False
+dashboard HTTP 200           PASS   HTTP 200 on port 8501; logs clean (tail 50)
+pipeline_metrics lag <= 300s PASS   latest_ingested_at=2026-11-27 01:09:00 lag_sec=59 limit=300 (exit=0)
+
+SUMMARY: 8/8 checks passed
+verify_exit=0
+```
+
+### D.5 ruff and the full CI pytest run
+
+Host Python is 3.14, so both commands run in the pinned Python 3.11 producer container with the
+whole repository mounted at `/work` (the CI-equivalent layout that collects 18 tests). The
+`docker : ... RemoteException` lines are PowerShell wrappers around Docker/pip stderr, not test
+or lint failures; the captured `$LASTEXITCODE` is the result.
+
+```
+> docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer sh -c "pip install -q -r requirements-dev.txt && ruff check ." 2>&1; "ruff_exit=$LASTEXITCODE"
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager.
+[notice] A new release of pip is available: 24.0 -> 26.3
+All checks passed!
+ruff_exit=0
+
+> docker compose run --rm --no-deps -v "${PWD}:/work" -w /work producer sh -c "pip install -q -r requirements-dev.txt -r requirements.txt && python -m pytest -q" 2>&1; "pytest_exit=$LASTEXITCODE"
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager.
+[notice] A new release of pip is available: 24.0 -> 26.3
+..................                                                       [100%]
+18 passed in 1.40s
+pytest_exit=0
+```
+
+Actual `git diff` for the two edited text files (no other source file changed):
+
+```
+> git diff --stat
+ docker-compose.yml        |   3 +++
+ docs/images/dashboard.png | Bin 52791 -> 54783 bytes
+ scripts/verify.ps1        |   8 ++++++--
+ 3 files changed, 9 insertions(+), 2 deletions(-)
+```
+
+### D.6 Retaken screenshot from the fixed container
+
+The same pinned Playwright container wrote `docs/images/dashboard.png` directly from the live,
+shim-free dashboard:
+
+```
+> docker run --rm --add-host=host.docker.internal:host-gateway -v "<temp>/opencode:/work:ro" -v "${PWD}/docs/images:/out" -w /work mcr.microsoft.com/playwright/python:v1.49.1-noble sh -c "pip install -q playwright==1.49.1 && python /work/capture_dashboard_fixed.py" 2>&1; "capture_exit=$LASTEXITCODE"
+dashboard.png bytes 54783
+Pipeline health visible: True
+canvases 7
+capture_exit=0
+```
+
+The saved PNG was opened with the view tool. It shows **Pipeline health** with Ingestion lag (s)
+33, Windows / hour (24h) 28.1, Avg commit lag (s) 1563, Max commit lag (s) 433830, the
+windows-per-hour bar chart and the price chart. No error text, personal data or browser chrome.
+
+### D.7 Decisions, deviations and honest notes
+
+- The fix is one environment setting on the dashboard service, not a Dockerfile or source change:
+  `PYTHONPATH=/app` makes `from dashboard.queries import ...` resolve while leaving every other
+  service's environment untouched. `docs/images/dashboard.png` was retaken from the fixed container.
+- Root cause was reproduced first (real `ModuleNotFoundError` in both log and page) and only then
+  fixed; the shim was verified absent before and after the fix with an explicit `ls` check.
+- The HTTP check alone could not catch this (HTTP 200 on an error page), which is why check 7 now
+  also scans `docker compose logs --tail 50 dashboard`. No eighth/ninth check was added.
+- The regex was proven against the two real pre-fix log lines (`pre_fix_log_hits=2`); the full
+  script then passed 8/8. No test or assertion was weakened or deleted.
+- `docker compose build dashboard` reused cached image layers because only compose environment
+  changed; the container was recreated so the new environment took effect.
+- Lines in D.5 that mention pip notices were shortened for readability; the `All checks passed!`
+  and `18 passed` lines and exit codes are verbatim. No number in this section was invented.
+- No data was deleted; only the dashboard container was recreated twice. All nine services stayed
+  up and the DAG/warehouse/lake were not touched.
+
+### D.8 Status
+
+- [x] Bug reproduced from the image with no shim; log and page show `ModuleNotFoundError`
+- [x] Root cause identified: `streamlit run` does not put `/app` on `sys.path`
+- [x] Fixed with `PYTHONPATH: /app` on the dashboard service; rebuilt and recreated only dashboard
+- [x] Playwright asserted `Pipeline health` present and no `ModuleNotFoundError` / `Traceback`
+- [x] `scripts/verify.ps1` strengthened, still eight checks, 8/8 passed
+- [x] ruff clean; full CI-equivalent pytest 18/18 passed
+- [x] `docs/images/dashboard.png` retaken from the fixed container and visually confirmed

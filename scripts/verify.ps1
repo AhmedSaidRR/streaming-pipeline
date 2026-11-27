@@ -87,13 +87,17 @@ $dagLine = $dags | Where-Object { $_ -match "^\s*streaming_analytics\s*\|" } | S
 Add-Result "DAG exists & unpaused" ($dagsCode -eq 0 -and $null -ne $dagLine -and $dagLine -match "\bFalse\b") `
     $(if ($dagLine) { $dagLine.Trim() } else { "DAG not found (exit=$dagsCode)" })
 
-# 7. Streamlit dashboard answers on port 8501.
+# 7. Streamlit dashboard answers on port 8501 and its recent logs have no import/traceback errors.
 $dashCode = 0
 try {
     $resp = Invoke-WebRequest -Uri "http://localhost:8501" -UseBasicParsing -TimeoutSec 10
     $dashCode = [int]$resp.StatusCode
 } catch { $dashCode = 0 }
-Add-Result "dashboard HTTP 200" ($dashCode -eq 200) "HTTP $dashCode on port 8501"
+$dashLogs = @(docker compose logs --tail 50 dashboard 2>&1 | ForEach-Object { "$_" })
+$logErrors = @($dashLogs | Where-Object { $_ -match "Traceback|ModuleNotFoundError" })
+$dashOk = ($dashCode -eq 200 -and $logErrors.Count -eq 0)
+$logDetail = if ($logErrors.Count -eq 0) { "logs clean (tail 50)" } else { "logs contain: " + ($logErrors -join "; ") }
+Add-Result "dashboard HTTP 200" $dashOk "HTTP $dashCode on port 8501; $logDetail"
 
 # 8. pipeline_metrics view reports ingestion lag within the 5-minute threshold.
 $lagSql = "select coalesce(round(ingestion_lag_seconds::numeric)::text,'na') || '|' || coalesce(to_char(latest_ingested_at,'YYYY-MM-DD HH24:MI:SS'),'none') from marts.pipeline_metrics;"
